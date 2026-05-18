@@ -1,0 +1,14 @@
+# Hammerfile for the standalone `lux-deploy` binary. Tasks live at the top
+# level (no namespace) so commands read as `lux-deploy up`, not
+# `lux-deploy deploy:up`. The lux-fw plugin mounts the engine under
+# `:deploy` for its own CLI.
+
+require 'lux_deploy'
+
+# Auto-load the app's deploy bootstrap, if present, before tasks fire.
+# A consumer can use this to inject Ruby (e.g. a pre-deploy hook) without
+# writing a custom Hammerfile.
+init = File.join(Dir.pwd, 'config', 'deploy', 'init.rb')
+load init if File.file?(init)
+
+LuxDeploy::Hammer.register(self)
