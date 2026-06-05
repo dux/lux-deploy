@@ -30,7 +30,7 @@ module LuxDeploy
     end
 
     # Streamed run (stdout/stderr pass through). Use for long-running steps
-    # the user wants to watch (bundle install, smoke test).
+    # the user wants to watch (bundle install, verification hooks).
     def stream(cmd, as: :root, allow_fail: false)
       remote = wrap(cmd, as)
       argv = ssh_argv + [remote]
@@ -58,7 +58,7 @@ module LuxDeploy
     # (via Process.exec). Use for shells, REPLs, psql - anything that needs
     # job control. Does not return on success.
     def exec(cmd, as: :root)
-      remote = wrap(cmd, as)
+      remote = wrap(cmd, as, interactive: true)
       argv = ssh_argv(interactive: true) + [remote]
       log argv, cmd
       return if dry_run
@@ -96,17 +96,25 @@ module LuxDeploy
       ]
     end
 
-    def wrap(cmd, as)
+    def wrap(cmd, as, interactive: false)
       case as
-      when :root    then cmd
+      when :root then cmd
       when :service, :deployer
-        # sudo -i backslash-escapes every shell metachar including newlines, so
-        # multi-line scripts get collapsed by the target shell (\<nl> = line
-        # continuation). Transport the script base64-encoded so no metachars
-        # survive into the service user's shell re-parse.
-        b64 = [cmd].pack('m0')
-        inner = "echo #{b64} | base64 -d | bash -l"
-        "sudo -iu #{service_user} bash -lc #{Shellwords.escape(inner)}"
+        if interactive
+          # Interactive shells need a TTY on stdin, so we can't use the
+          # base64-pipe transport (it leaves bash reading from a closed pipe
+          # and the inner `exec bash -li` exits immediately). Single-line
+          # commands don't need the b64 dance anyway - just shell-escape.
+          "sudo -iu #{service_user} -- bash -lc #{Shellwords.escape(cmd)}"
+        else
+          # sudo -i backslash-escapes every shell metachar including newlines, so
+          # multi-line scripts get collapsed by the target shell (\<nl> = line
+          # continuation). Transport the script base64-encoded so no metachars
+          # survive into the service user's shell re-parse.
+          b64 = [cmd].pack('m0')
+          inner = "echo #{b64} | base64 -d | bash -l"
+          "sudo -iu #{service_user} bash -lc #{Shellwords.escape(inner)}"
+        end
       else raise "unknown ssh user: #{as}"
       end
     end

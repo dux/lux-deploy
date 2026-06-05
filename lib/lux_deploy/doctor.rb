@@ -13,7 +13,10 @@ module LuxDeploy
 
     # Placeholders the engine always provides at deploy time; templates
     # may reference these without declaring them in .env or .yaml.
-    PROVIDED_VARS ||= %w[GIT_BRANCH GIT_BRANCH_UNDERSCORE PORT DIR RUBY RUBY_DIR].freeze
+    PROVIDED_VARS ||= %w[
+      GIT_BRANCH GIT_BRANCH_UNDERSCORE APP APP_UNDERSCORE HASH TAG
+      PORT DIR RUBY RUBY_DIR
+    ].freeze
 
     module_function
 
@@ -61,12 +64,16 @@ module LuxDeploy
       out.include?('__OK__')
     end
 
-    # Verify every {{VAR}} inside caddy.conf / systemd.service / job.service
-    # resolves from git vars + .env (or .env.staging). Returns failure count.
     # Lifecycle hooks (run during `up` if present in config/deploy/).
     # Optional - doctor reports their presence/absence, never creates.
     # Scaffolds with explanatory header comments ship via `app:init`.
-    HOOK_FILES ||= %w[before_local.sh after_server.sh].freeze
+    HOOK_FILES ||= %w[local_before.sh remote_before.sh remote_after.sh local_after.sh].freeze
+
+    # True when any local config/deploy template references {{RUBY}}. Gates
+    # the ruby/bundler host checks so a Go/Python app doesn't fail doctor.
+    def ruby_runtime?(dir = './config/deploy')
+      Dir.glob("#{dir}/*").any? { |f| File.file?(f) && File.read(f).include?('{{RUBY') }
+    end
 
     def local_checks(_config)
       dir = './config/deploy'
@@ -128,20 +135,17 @@ module LuxDeploy
 
       yaml_keys = yaml_data.keys.map { |k| k.to_s.upcase }
 
-      env_keys = {}
-      %w[.env .env.staging].each do |name|
-        path = "#{dir}/#{name}"
-        next unless File.exist?(path)
-        env_keys[name] = File.read(path).scan(/^([A-Z][A-Z0-9_]*)=/).flatten
-      end
-
-      # Cross-check every placeholder in each template (including .env*).
-      # yaml_keys are always provided; env_keys depend on which env template
-      # is selected at deploy time, so we check each separately. .env.staging
-      # and job.service are optional; skip with a note when absent.
-      optional = %w[.env.staging job.service]
-      placeholder_targets = %w[.env .env.staging caddy.conf systemd.service job.service]
-      placeholder_targets.each do |name|
+      # Every template is rendered with the same vars: engine-provided +
+      # yaml. The rendered .env is uploaded verbatim; it never feeds back
+      # into the template namespace, so caddy.conf / *.service can only
+      # reference yaml keys + engine vars (not anything defined in .env).
+      # Every *.service file is a service; only systemd.service is required.
+      # PORT-prefixed placeholders are engine-provided (auto-allocated).
+      service_files       = Dir.children(dir).select { |f| f.end_with?('.service') && !f.start_with?('!') }.sort
+      optional            = %w[.env.staging] + (service_files - %w[systemd.service])
+      placeholder_targets = %w[.env .env.staging caddy.conf] + service_files
+      provided            = PROVIDED_VARS + yaml_keys
+      placeholder_targets.uniq.each do |name|
         path = "#{dir}/#{name}"
         unless File.exist?(path)
           skip.call(name) if optional.include?(name)
@@ -149,24 +153,10 @@ module LuxDeploy
         end
 
         placeholders = File.read(path).scan(Template::PLACEHOLDER).flatten.uniq
-
-        # .env* templates can only reference vars provided BEFORE rendering;
-        # other templates can also reference keys defined in the env itself.
-        if name.start_with?('.env')
-          provided = PROVIDED_VARS + yaml_keys
-          missing  = placeholders - provided
-          ok       = missing.empty?
-          report.call(ok, "#{name}: placeholders resolve",
-                      ok ? nil : "missing: #{missing.map { |v| "{{#{v}}}" }.join(' ')}")
-        else
-          env_keys.each do |env_name, keys|
-            provided = PROVIDED_VARS + yaml_keys + keys
-            missing  = placeholders - provided
-            ok       = missing.empty?
-            report.call(ok, "#{name}: placeholders resolve against #{env_name}",
-                        ok ? nil : "missing: #{missing.map { |v| "{{#{v}}}" }.join(' ')}")
-          end
-        end
+        missing      = placeholders.reject { |v| provided.include?(v) || v.start_with?('PORT') }
+        ok           = missing.empty?
+        report.call(ok, "#{name}: placeholders resolve",
+                    ok ? nil : "missing: #{missing.map { |v| "{{#{v}}}" }.join(' ')}")
       end
 
       failed
@@ -218,31 +208,24 @@ module LuxDeploy
           "sudo -iu #{user} bash -lc 'command -v mise >/dev/null'",
           nil
         ],
-        [
-          "ruby on #{user} PATH",
-          "sudo -iu #{user} bash -lc 'command -v ruby >/dev/null && ruby -v'",
-          nil
-        ],
-        [
-          "bundler on #{user} PATH",
-          "sudo -iu #{user} bash -lc 'command -v bundle >/dev/null'",
-          "sudo -iu #{user} bash -lc 'gem install bundler --no-document'"
-        ],
+        # Ruby/bundler only matter when a template references {{RUBY}};
+        # a Go/Python app builds in remote_before and needs neither.
+        *(ruby_runtime? ? [
+          [
+            "ruby on #{user} PATH",
+            "sudo -iu #{user} bash -lc 'command -v ruby >/dev/null && ruby -v'",
+            nil
+          ],
+          [
+            "bundler on #{user} PATH",
+            "sudo -iu #{user} bash -lc 'command -v bundle >/dev/null'",
+            "sudo -iu #{user} bash -lc 'gem install bundler --no-document'"
+          ]
+        ] : []),
         [
           'xcaddy available (for plugin rebuilds)',
           'command -v xcaddy >/dev/null',
           nil
-        ],
-        [
-          # Required by db:pg:create / db:pg:destroy / db:pg:push /
-          # db:pg:transfer (which issue CREATE/DROP DATABASE as deployer
-          # via the maintenance db). Passes silently when postgres is not
-          # installed or the role doesn't exist - both legitimate cases.
-          "#{user} PG role has CREATEDB (if postgres + role exist)",
-          "if ! command -v psql >/dev/null 2>&1; then exit 0; fi; " \
-            "if ! sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='#{user}'\" 2>/dev/null | grep -q '^1$'; then exit 0; fi; " \
-            "sudo -u postgres psql -tAc \"SELECT rolcreatedb FROM pg_roles WHERE rolname='#{user}'\" 2>/dev/null | grep -q '^t$'",
-          "sudo -u postgres psql -c \"ALTER ROLE #{user} CREATEDB\" 2>/dev/null"
         ],
         [
           'ssh password auth disabled (warn-only)',

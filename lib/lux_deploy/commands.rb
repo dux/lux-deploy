@@ -8,22 +8,21 @@ module LuxDeploy
       ctx = Context.build(opts)
       step "deploy #{ctx.app} (branch #{ctx.branch}) -> #{ctx.host}"
 
-      run_before_local_hook(ctx)
+      check_renamed_hooks!
+      run_local_before_hook(ctx)
 
       ensure_remote_dirs(ctx)
-      ctx.port ||= allocate_port(ctx)
+      wipe_stale_new_release(ctx)
+      ctx.ports ||= allocate_ports(ctx)
       render_artifacts(ctx)
 
-      step 'cache gems into vendor/cache'
-      # Ship .gem files with the rsync so the server skips downloads for
-      # platform-matching gems. Native gems (pg etc.) cached for darwin will
-      # be re-fetched from rubygems on Debian and built locally - bundler
-      # handles that fallback automatically, so a failure here is non-fatal.
-      system('bundle', 'cache', '--no-install') or warn 'bundle cache failed, continuing without local cache'
-
       step 'rsync code'
-      ctx.ssh.rsync('./', "#{ctx.app_dir}/new-release/",
-                    excludes: %w[.git tmp log node_modules .DS_Store coverage])
+      # Source is config `src:` (default ./). An app may build an artifact in
+      # local_before and point src: at it. "!*" drops any file whose name
+      # starts with "!" at any depth - the disable convention (e.g.
+      # !job.service, !scratch.rb never ship).
+      ctx.ssh.rsync(ctx.config.src, "#{ctx.app_dir}/new-release/",
+                    excludes: %w[.git tmp log node_modules .DS_Store coverage !*])
 
       step 'symlink shared dirs into new-release'
       ctx.ssh.run(<<~SH, as: :service)
@@ -36,46 +35,7 @@ module LuxDeploy
       step 'write rendered .env / systemd.service / caddy.config'
       upload_artifacts(ctx)
 
-      step 'bundle install'
-      # Bundler 4 dropped --deployment / --without flags. We also avoid
-      # `deployment=true` because it implies `frozen=true`, which breaks apps
-      # whose Gemfile resolves to different sources per environment (e.g.
-      # local path -> .gems fallback). A fresh release dir has no prior
-      # bundle config, so regenerating the lockfile is local to this release.
-      ctx.ssh.stream(
-        "cd #{Shellwords.escape(ctx.app_dir)}/new-release && " \
-        '( [ -f mise.toml ] && mise trust mise.toml >/dev/null 2>&1 || true ) && ' \
-        'bundle config set --local frozen false && ' \
-        "bundle config set --local path vendor/bundle && " \
-        "bundle config set --local without 'development test' && " \
-        'bundle install --jobs 4 --retry 2',
-        as: :service
-      )
-
-      smoke = ctx.config.smoke_command
-      unless smoke
-        ctx.ssh.run("rm -rf #{Shellwords.escape(ctx.app_dir)}/new-release", as: :service, allow_fail: true)
-        raise Error.new(
-          "config/deploy/.yaml: 'smoke_command:' is required.\n" \
-          "  It runs in new-release/ after bundle install; non-zero exit rolls\n" \
-          "  the deploy back. Use any command in any language - examples:\n" \
-          "    smoke_command: bundle exec lux e 1\n" \
-          "    smoke_command: bundle exec rails runner 'puts 1'\n" \
-          "    smoke_command: bundle exec rspec spec/smoke\n" \
-          "    smoke_command: ./bin/smoke"
-        )
-      end
-
-      step "smoke test (#{smoke})"
-      ok = ctx.ssh.stream(
-        "cd #{Shellwords.escape(ctx.app_dir)}/new-release && #{smoke}",
-        as: :service, allow_fail: true
-      )
-      unless ok
-        warn 'smoke failed; rolling back (release/ untouched, removing new-release/)'
-        ctx.ssh.run("rm -rf #{Shellwords.escape(ctx.app_dir)}/new-release", as: :service, allow_fail: true)
-        raise Error.new("smoke test failed (#{ctx.app})")
-      end
+      run_remote_before_hook(ctx)
 
       step 'atomic release swap'
       ctx.ssh.run(<<~SH, as: :service)
@@ -89,29 +49,31 @@ module LuxDeploy
       install_system_symlinks(ctx)
 
       step 'reload services'
-      web_unit = web_unit(ctx)
-      ctx.ssh.run(<<~SH)
-        systemctl daemon-reload && \
-        systemctl enable --now #{web_unit} && \
-        systemctl restart #{web_unit} && \
-        systemctl reload caddy
-      SH
+      reload_services(ctx)
 
-      if ctx.job_template?
-        step 'restart job service'
-        job_unit = job_unit(ctx)
-        ctx.ssh.run(<<~SH)
-          systemctl enable --now #{job_unit} && \
-          systemctl restart #{job_unit}
-        SH
-      end
-
-      run_after_server_hook(ctx)
+      run_remote_after_hook(ctx)
 
       step "write #{Manifest::FILENAME}"
       upload_manifest(ctx)
 
-      step "done. https://#{ctx.domain} (port #{ctx.port})"
+      run_local_after_hook(ctx)
+
+      step "done. https://#{ctx.domain} (#{ctx.ports.map { |k, v| "#{k}=#{v}" }.join(' ')})"
+    end
+
+    # -------- lifecycle hook commands -------------------------------------
+
+    def hook(opts, side, timing)
+      ctx = Context.build(opts, render: false)
+      check_renamed_hooks!
+
+      case [side.to_sym, timing.to_sym]
+      when [:local, :before]  then run_local_before_hook(ctx)
+      when [:remote, :before] then run_remote_before_hook(ctx)
+      when [:remote, :after]  then run_remote_after_hook(ctx)
+      when [:local, :after]   then run_local_after_hook(ctx, strict: true)
+      else raise Error.new("unknown lifecycle hook: #{side}:#{timing}")
+      end
     end
 
     # -------- destroy ------------------------------------------------------
@@ -121,14 +83,10 @@ module LuxDeploy
       step "destroy #{ctx.app} on #{ctx.host}"
       confirm_destroy!(ctx) unless opts[:yes]
 
-      web_unit = web_unit(ctx)
       step 'stop + disable systemd units'
-      lines = ["systemctl disable --now #{web_unit} 2>/dev/null || true"]
-      lines << "rm -f #{SYSTEMD_DIR}/#{web_unit}.service"
-      if ctx.config.job_service_prefix
-        job_unit = job_unit(ctx)
-        lines << "systemctl disable --now #{job_unit} 2>/dev/null || true"
-        lines << "rm -f #{SYSTEMD_DIR}/#{job_unit}.service"
+      lines = ctx.services.flat_map do |s|
+        ["systemctl disable --now #{s.unit} 2>/dev/null || true",
+         "rm -f #{SYSTEMD_DIR}/#{s.unit}.service"]
       end
       lines << 'systemctl daemon-reload'
       ctx.ssh.run(lines.join("\n"), allow_fail: true)
@@ -191,7 +149,7 @@ module LuxDeploy
         end
       end
 
-      $stderr.puts "done. edit #{dest_dir}/.env (SECRET, DB_URL, DOMAIN) and #{dest_dir}/.yaml, then run 'lux-deploy doctor' and 'lux-deploy up'"
+      $stderr.puts "done. edit #{dest_dir}/.env (SECRET, DOMAIN) and #{dest_dir}/.yaml, then run 'lux-deploy doctor' and 'lux-deploy up'"
     end
 
     # -------- server:ssh --------------------------------------------------
@@ -214,6 +172,26 @@ module LuxDeploy
       ctx.ssh.exec("journalctl -u #{unit} -n 200 -f")
     end
 
+    # -------- log ---------------------------------------------------------
+
+    # `lux-deploy log` lists the shared release/log dir; `--log <name>` dumps the
+    # last `--lines` (200) lines of that file (the `.log` suffix is optional).
+    def log(opts)
+      ctx     = Context.build(opts, render: false)
+      log_dir = "#{ctx.app_dir}/release/log"
+
+      if (name = opts[:log])
+        name  = "#{name}.log" unless name.to_s.end_with?('.log')
+        lines = (opts[:lines] || 200).to_i
+        path  = "#{log_dir}/#{name}"
+        step "tail -n #{lines} #{path}"
+        ctx.ssh.stream("tail -n #{lines} #{Shellwords.escape(path)}", as: :service, allow_fail: true)
+      else
+        step "logs in #{log_dir}"
+        ctx.ssh.stream("ls -lh #{Shellwords.escape(log_dir)}/", as: :service, allow_fail: true)
+      end
+    end
+
     # -------- server:restart ----------------------------------------------
 
     def server_restart(opts)
@@ -232,221 +210,13 @@ module LuxDeploy
       ctx.ssh.stream("systemctl status #{unit} --no-pager", allow_fail: true)
     end
 
-    # -------- db:psql -----------------------------------------------------
+    # -------- server:errors -----------------------------------------------
 
-    # Sources the remote .env so DB_URL never appears in the ssh command
-    # line (which the logger would print).
-    def db_psql(opts)
-      ctx = Context.build(opts, render: false)
-      step "psql #{ctx.app}"
-      ctx.ssh.exec(<<~SH, as: :service)
-        set -a && . #{Shellwords.escape(ctx.app_dir)}/.env && set +a && exec psql "$DB_URL"
-      SH
-    end
-
-    # -------- db:pg:check -------------------------------------------------
-
-    # Quick read-only probe of the remote DB. Connects via DB_URL from
-    # server .env (sourced inside the ssh command so secrets never appear
-    # on the ssh argv).
-    def db_pg_check(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:check #{ctx.app} on #{ctx.host}"
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        echo "dbname: $DBNAME"
-        psql "$DB_URL" -c "SELECT current_database() AS db, pg_size_pretty(pg_database_size(current_database())) AS size, (SELECT count(*) FROM information_schema.tables WHERE table_schema='public') AS public_tables, version() AS version"
-      SH
-    end
-
-    # -------- db:pg:create -----------------------------------------------
-
-    # CREATE DATABASE for the dbname embedded in remote .env DB_URL. We
-    # connect to the maintenance db (postgres) using the same credentials.
-    # Requires deployer's pg role to have CREATEDB (see doctor).
-    def db_pg_create(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:create #{ctx.app} on #{ctx.host}"
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        echo "creating database $DBNAME"
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$DBNAME\\""
-      SH
-    end
-
-    # -------- db:pg:destroy ----------------------------------------------
-
-    # DROP DATABASE for the dbname embedded in remote .env DB_URL. Same
-    # type-the-domain confirmation as the app-level `destroy` so a typo
-    # can't nuke prod.
-    def db_pg_destroy(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:destroy #{ctx.app} on #{ctx.host}"
-      confirm_pg_destroy!(ctx, 'DROP DATABASE') unless opts[:yes]
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        echo "dropping database $DBNAME"
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"$DBNAME\\""
-      SH
-    end
-
-    # -------- db:pg:backup -----------------------------------------------
-
-    # pg_dump on the server, scp the .sql.gz down, leave it compressed.
-    # No restore (unlike pull). Timestamped so successive backups stack.
-    def db_pg_backup(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:backup #{ctx.app} on #{ctx.host}"
-      ts          = Time.now.strftime('%Y%m%d-%H%M%S')
-      remote_dump = "/tmp/lux-deploy-#{ctx.app}-#{ts}.sql.gz"
-      local_dump  = "./tmp/#{ctx.app}-#{ts}.sql.gz"
-
-      FileUtils.mkdir_p('./tmp')
-      step "pg_dump on #{ctx.host} -> #{remote_dump}"
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        pg_dump --no-privileges --no-owner "$DB_URL" | gzip > #{Shellwords.escape(remote_dump)}
-      SH
-
-      step "scp -> #{local_dump}"
-      FileUtils.rm_f(local_dump)
-      ctx.ssh.scp_from(remote_dump, local_dump)
-      ctx.ssh.run("rm -f #{Shellwords.escape(remote_dump)}", as: :service, allow_fail: true)
-
-      step "done. #{local_dump}"
-    end
-
-    # -------- db:pg:pull -------------------------------------------------
-
-    # Dumps remote DB (via DB_URL from server .env) and restores into the
-    # local DB pointed to by local $DB_URL. Drops + recreates local DB.
-    def db_pg_pull(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:pull #{ctx.app} -> local"
-
-      local_db_url = ENV['DB_URL'].to_s
-      raise Error.new('local $DB_URL not set') if local_db_url.empty?
-      local_db_name = local_db_url.split('/').last.to_s.split('?').first
-      raise Error.new("can't parse db name from local DB_URL") if local_db_name.empty?
-
-      FileUtils.mkdir_p('./tmp')
-      remote_dump = "/tmp/lux-deploy-#{ctx.app}-dump.sql.gz"
-      local_dump  = "./tmp/#{ctx.app}-dump.sql.gz"
-      local_sql   = local_dump.sub(/\.gz$/, '')
-
-      step "pg_dump on #{ctx.host} -> #{remote_dump}"
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        pg_dump --no-privileges --no-owner "$DB_URL" | gzip > #{Shellwords.escape(remote_dump)}
-      SH
-
-      step "scp -> #{local_dump}"
-      FileUtils.rm_f(local_dump)
-      ctx.ssh.scp_from(remote_dump, local_dump)
-      ctx.ssh.run("rm -f #{Shellwords.escape(remote_dump)}", as: :service, allow_fail: true)
-
-      step 'gunzip'
-      FileUtils.rm_f(local_sql)
-      system('gunzip', local_dump) or raise Error.new('gunzip failed')
-
-      step "dropdb -f #{local_db_name} && createdb #{local_db_name}"
-      system('dropdb', '-f', local_db_name) # may not exist; ignore
-      system('createdb', local_db_name) or raise Error.new("createdb #{local_db_name} failed")
-
-      step 'psql restore'
-      system('bash', '-c', "psql #{Shellwords.escape(local_db_url)} < #{Shellwords.escape(local_sql)}") \
-        or raise Error.new('psql restore failed')
-
-      step "done. imported into #{local_db_name}"
-    end
-
-    # -------- db:pg:push -------------------------------------------------
-
-    # Dumps local DB (via $DB_URL) and restores into the remote DB pointed
-    # at by remote .env DB_URL. Drops + recreates the remote DB. Same
-    # type-the-domain confirmation as destroy.
-    def db_pg_push(opts)
-      ctx = Context.build(opts, render: false)
-      step "db:pg:push local -> #{ctx.app} on #{ctx.host}"
-      confirm_pg_destroy!(ctx, 'OVERWRITE REMOTE DB') unless opts[:yes]
-
-      local_db_url = ENV['DB_URL'].to_s
-      raise Error.new('local $DB_URL not set') if local_db_url.empty?
-
-      FileUtils.mkdir_p('./tmp')
-      ts          = Time.now.strftime('%Y%m%d-%H%M%S')
-      local_dump  = "./tmp/#{ctx.app}-push-#{ts}.sql.gz"
-      remote_dump = "/tmp/lux-deploy-#{ctx.app}-push-#{ts}.sql.gz"
-
-      step "pg_dump local -> #{local_dump}"
-      FileUtils.rm_f(local_dump)
-      ok = system('bash', '-c',
-                  "pg_dump --no-privileges --no-owner #{Shellwords.escape(local_db_url)} | gzip > #{Shellwords.escape(local_dump)}")
-      raise Error.new('local pg_dump failed') unless ok
-
-      step "scp -> #{ctx.host}:#{remote_dump}"
-      ctx.ssh.scp_to(local_dump, remote_dump)
-
-      step 'drop + create remote db, restore'
-      ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(ctx)}
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"$DBNAME\\""
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$DBNAME\\""
-        gunzip -c #{Shellwords.escape(remote_dump)} | psql "$DB_URL" -v ON_ERROR_STOP=1
-      SH
-
-      ctx.ssh.run("rm -f #{Shellwords.escape(remote_dump)}", allow_fail: true)
-      step "done. local copy kept: #{local_dump}"
-    end
-
-    # -------- db:pg:transfer ---------------------------------------------
-
-    # Server-to-server copy. Builds two contexts (--from + --server) that
-    # share the same local config/deploy/.yaml but point at different
-    # hosts. Routes the dump through the local box (./tmp/<app>-xfer-…)
-    # so the source and target servers don't need ssh access to each
-    # other. Drops + recreates the target DB.
-    def db_pg_transfer(opts)
-      from = opts[:from].to_s.strip
-      raise Error.new('--from HOST is required') if from.empty?
-
-      to_ctx   = Context.build(opts, render: false)
-      from_ctx = Context.build(opts.merge(server: from), render: false)
-      raise Error.new('--from and --server are the same host') if from_ctx.host == to_ctx.host
-
-      step "db:pg:transfer #{from_ctx.host} -> #{to_ctx.host} (#{to_ctx.app})"
-      confirm_pg_destroy!(to_ctx, "OVERWRITE #{to_ctx.host}") unless opts[:yes]
-
-      FileUtils.mkdir_p('./tmp')
-      ts         = Time.now.strftime('%Y%m%d-%H%M%S')
-      src_dump   = "/tmp/lux-deploy-#{from_ctx.app}-xfer-#{ts}.sql.gz"
-      local_dump = "./tmp/#{from_ctx.app}-xfer-#{ts}.sql.gz"
-      dst_dump   = "/tmp/lux-deploy-#{to_ctx.app}-xfer-#{ts}.sql.gz"
-
-      step "pg_dump on #{from_ctx.host} -> #{src_dump}"
-      from_ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(from_ctx)}
-        pg_dump --no-privileges --no-owner "$DB_URL" | gzip > #{Shellwords.escape(src_dump)}
-      SH
-
-      step "scp #{from_ctx.host} -> #{local_dump}"
-      FileUtils.rm_f(local_dump)
-      from_ctx.ssh.scp_from(src_dump, local_dump)
-      from_ctx.ssh.run("rm -f #{Shellwords.escape(src_dump)}", as: :service, allow_fail: true)
-
-      step "scp -> #{to_ctx.host}:#{dst_dump}"
-      to_ctx.ssh.scp_to(local_dump, dst_dump)
-
-      step "drop + create on #{to_ctx.host}, restore"
-      to_ctx.ssh.stream(<<~SH, as: :service)
-        #{db_url_preamble(to_ctx)}
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"$DBNAME\\""
-        psql "$MAINT" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$DBNAME\\""
-        gunzip -c #{Shellwords.escape(dst_dump)} | psql "$DB_URL" -v ON_ERROR_STOP=1
-      SH
-
-      to_ctx.ssh.run("rm -f #{Shellwords.escape(dst_dump)}", allow_fail: true)
-      step "done. local copy kept: #{local_dump}"
+    def server_errors(opts)
+      ctx  = Context.build(opts, render: false)
+      path = "#{ctx.app_dir}/release/log/error.log"
+      step "tail -f #{path}"
+      ctx.ssh.exec("tail -f #{Shellwords.escape(path)}", as: :service)
     end
 
     # -------- helpers ------------------------------------------------------
@@ -461,32 +231,55 @@ module LuxDeploy
       raise Error.new('aborted; pass --yes to skip prompt') unless typed == ctx.domain
     end
 
-    def confirm_pg_destroy!(ctx, action)
-      $stderr.print "type '#{ctx.domain}' to confirm #{action} on #{ctx.host}: "
-      typed = $stdin.gets.to_s.strip
-      raise Error.new('aborted; pass --yes to skip prompt') unless typed == ctx.domain
+    # Load a remote .env file into the current shell, exporting each
+    # KEY=VALUE line. Safer than `. file` because each line is passed as
+    # a single quoted argument to `export` - bash word-splitting and
+    # glob expansion never touch the value. Strips surrounding "..." or
+    # '...' from the value so `DOMAIN="a, *.b"` and `DOMAIN=a, *.b`
+    # both yield DOMAIN=`a, *.b` (matching dotenv conventions).
+    def env_source_sh(path)
+      body = <<~'SH'.chomp
+        while IFS= read -r __l || [ -n "$__l" ]; do
+          case "$__l" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) continue ;;
+          esac
+          __v="${__l#*=}"
+          case "$__v" in
+            \"*\") __v="${__v#\"}"; __v="${__v%\"}" ;;
+            \'*\') __v="${__v#\'}"; __v="${__v%\'}" ;;
+          esac
+          export "${__l%%=*}=$__v"
+        done <
+      SH
+      "#{body} #{Shellwords.escape(path)}"
     end
 
-    # Bash preamble shared by every db:pg:* server-side command. Sources
-    # the remote .env (so DB_URL is in-shell, never on the ssh argv) then
-    # derives:
-    #   DBNAME = the database name from $DB_URL
-    #   MAINT  = $DB_URL rewritten to point at the `postgres` maintenance
-    #            db, used to issue CREATE/DROP DATABASE since you can't
-    #            drop the db you're connected to.
-    # The sed snippets are intentionally raw (single-quoted heredoc) so
-    # Ruby leaves the backreferences and `\n` literal.
-    def db_url_preamble(ctx)
-      parse = <<~'PARSE'.chomp
-        DBNAME=$(printf '%s\n' "$DB_URL" | sed -E 's#.*/([^/?]+)([?].*)?$#\1#')
-        MAINT=$(printf '%s\n' "$DB_URL" | sed -E 's#/([^/?]+)([?].*)?$#/postgres\2#')
-      PARSE
-      "set -a && . #{Shellwords.escape(ctx.app_dir)}/.env && set +a\n#{parse}"
+    # Remove any new-release/ left behind by a prior failed deploy.
+    # Runs at the start of `up` so a fresh rsync doesn't merge with
+    # stale gem builds / half-installed assets.
+    def wipe_stale_new_release(ctx)
+      step 'wipe stale new-release (if any from prior failed deploy)'
+      ctx.ssh.run("rm -rf #{Shellwords.escape(ctx.app_dir)}/new-release", as: :service, allow_fail: true)
     end
 
-    # systemd unit names. Bare (no .service suffix) since systemctl accepts both.
+    # Web unit name (bare, no .service suffix since systemctl accepts both).
+    # Used by server:restart/log/status which target the web service.
     def web_unit(ctx) = "#{ctx.config.service_prefix}-#{ctx.app}"
-    def job_unit(ctx) = "#{ctx.config.job_service_prefix}-#{ctx.app}"
+
+    # Enable + restart every discovered service, then reload caddy once.
+    # daemon-reload first so changed unit files are picked up. set -e aborts
+    # (and run raises) on the first failure.
+    def reload_services(ctx)
+      lines = ['set -e', 'systemctl daemon-reload']
+      ctx.services.each do |s|
+        lines << "systemctl enable --now #{s.unit}"
+        lines << "systemctl restart #{s.unit}"
+      end
+      lines << 'systemctl reload caddy'
+      ctx.ssh.run(lines.join("\n"))
+    end
 
     def ensure_remote_dirs(ctx)
       step 'ensure remote dirs'
@@ -496,59 +289,116 @@ module LuxDeploy
       SH
     end
 
-    def allocate_port(ctx)
-      step 'allocate port'
-      # Read PORT from existing .env if present (re-deploys reuse it)
-      existing = ctx.ssh.run(
-        "[ -f #{Shellwords.escape(ctx.app_dir)}/.env ] && " \
-        "grep -E '^PORT=' #{Shellwords.escape(ctx.app_dir)}/.env || true",
-        as: :service, allow_fail: true
-      ).strip
-      if existing =~ /^PORT=(\d+)/
-        port = $1.to_i
-        $stderr.puts "    reusing existing PORT=#{port}"
-        return port
+    # Resolve every managed PORT* token to a concrete port. Tokens come from
+    # needed_port_keys (PORT* keys in .env + {{PORT*}} placeholders in any
+    # template). Each is reused from the remote .env when present, else a free
+    # port is allocated from PORT_RANGE. The ss scan only runs when at least
+    # one new port must be allocated - re-deploys that reuse everything never
+    # probe the host. Returns an ordered {PORT: 3010, PORT_FOO: 3020} hash.
+    def allocate_ports(ctx)
+      step 'allocate ports'
+      needed   = needed_port_keys(ctx)
+      existing = read_existing_ports(ctx)
+      reused   = needed.select { |k| existing[k] }
+
+      ports = {}
+      reused.each { |k| ports[k] = existing[k] }
+
+      to_assign = needed - reused
+      unless to_assign.empty?
+        in_use = scan_listening_ports(ctx) | existing.values.to_set
+        to_assign.each do |k|
+          free = PORT_RANGE.find { |p| !in_use.include?(p) }
+          raise Error.new("no free port in 3010..3990 (step 10) for #{k}") unless free
+          ports[k] = free
+          in_use << free
+        end
       end
 
-      # Scan free port from PORT_RANGE
-      in_use = ctx.ssh.run("ss -tlnH | awk '{print $4}' | sed 's/.*://'", allow_fail: true)
-        .lines.map { |l| l.strip.to_i }.to_set
-      free = PORT_RANGE.find { |p| !in_use.include?(p) }
-      raise Error.new("no free port in 3010..3990 (step 10)") unless free
-      $stderr.puts "    allocated PORT=#{free}"
-      free
+      ordered = needed.each_with_object({}) { |k, h| h[k] = ports[k] }
+      ordered.each do |k, v|
+        $stderr.puts "    #{reused.include?(k) ? 'reusing' : 'allocated'} #{k}=#{v}"
+      end
+      ordered
     end
 
-    # Two-pass render:
-    #   1. compose base vars (git + yaml + plugin-provided), render .env
-    #   2. parse .env, merge result into vars (env overrides yaml so staging
-    #      branches can redefine DOMAIN), render the remaining templates.
+    # PORT* tokens this deploy manages: union of PORT-prefixed keys declared in
+    # the .env template(s) and {{PORT*}} placeholders referenced by caddy /
+    # systemd units. A web app with no explicit PORT still gets one because
+    # caddy.conf references {{PORT}}.
+    def needed_port_keys(ctx)
+      keys = []
+      [ctx.env_template_name, '.env'].uniq.each do |n|
+        src = ctx.template_source(n) or next
+        keys.concat(src.scan(/^(PORT[A-Z0-9_]*)\s*=/).flatten)
+      end
+      (['caddy.conf'] + ctx.services.map(&:template)).uniq.each do |n|
+        src = ctx.template_source(n) or next
+        keys.concat(src.scan(/\{\{(PORT[A-Z0-9_]*)\}\}/).flatten)
+      end
+      keys.uniq.map(&:to_sym)
+    end
+
+    # PORT* => Integer parsed from the remote .env (re-deploys reuse these).
+    def read_existing_ports(ctx)
+      out = ctx.ssh.run(
+        "[ -f #{Shellwords.escape(ctx.app_dir)}/.env ] && " \
+        "grep -E '^PORT[A-Z0-9_]*=' #{Shellwords.escape(ctx.app_dir)}/.env || true",
+        as: :service, allow_fail: true
+      )
+      out.lines.each_with_object({}) do |l, h|
+        h[$1.to_sym] = $2.to_i if l.strip =~ /^(PORT[A-Z0-9_]*)=(\d+)/
+      end
+    end
+
+    def scan_listening_ports(ctx)
+      ctx.ssh.run("ss -tlnH | awk '{print $4}' | sed 's/.*://'", allow_fail: true)
+        .lines.map { |l| l.strip.to_i }.to_set
+    end
+
+    # One-pass render. Every template (.env, caddy.conf, and each
+    # *.service unit) is rendered with the same var set: git-derived + yaml +
+    # engine-dynamic (PORT*/DIR, plus RUBY/RUBY_DIR when referenced).
+    # The rendered .env never feeds back into the namespace - it is a
+    # runtime-only file the app reads at boot, opaque to the engine.
     def render_artifacts(ctx)
       step 'render templates'
 
-      base_vars = ctx.base_vars.merge(
-        PORT:     ctx.port,
-        DIR:      ctx.app_dir,
-        RUBY:     ctx.ruby_path,
-        RUBY_DIR: File.dirname(ctx.ruby_path)
-      )
-
-      env_rendered = Template.render(ctx.read_template(ctx.env_template_name), base_vars)
-      env_hash     = Template.parse_env(env_rendered)
-
-      all_vars = base_vars.merge(env_hash)
-      ctx.domain = (env_hash[:DOMAIN] || base_vars[:DOMAIN]).to_s
-                    .split(',').first.to_s.strip.sub(/^\*\./, '')
-      raise Error.new('DOMAIN resolved to empty') if ctx.domain.empty?
-
-      ctx.rendered = {
-        '.env'            => env_rendered,
-        'caddy.config'    => Template.render(ctx.read_template('caddy.conf'), all_vars),
-        'systemd.service' => Template.render(ctx.read_template('systemd.service'), all_vars)
-      }
-      if ctx.job_template?
-        ctx.rendered['systemd.job.service'] = Template.render(ctx.read_template('job.service'), all_vars)
+      vars = ctx.base_vars.merge(ctx.ports).merge(DIR: ctx.app_dir)
+      # RUBY/RUBY_DIR (and the ssh ruby probe) only when a template asks for
+      # them - a Go/Python unit running a built binary never triggers it.
+      if ctx.ruby_used?
+        vars = vars.merge(RUBY: ctx.ruby_path, RUBY_DIR: File.dirname(ctx.ruby_path))
       end
+
+      # Persist every allocated PORT* into .env so allocate_ports reuses the
+      # same ports on the next deploy. Without this they only land in
+      # systemd/caddy, the reuse path never fires, and ports drift.
+      env_body = persist_ports(Template.render(ctx.read_template(ctx.env_template_name), vars), ctx.ports)
+
+      rendered = {
+        '.env'         => env_body,
+        'caddy.config' => Template.render(ctx.read_template('caddy.conf'), vars)
+      }
+      ctx.services.each do |s|
+        rendered[s.artifact] = Template.render(ctx.read_template(s.template), vars)
+      end
+      ctx.rendered = rendered
+    end
+
+    # Ensure every managed PORT* key appears with its value in the rendered
+    # .env body: replace an existing `KEY=` line or append one. The `=` anchor
+    # keeps PORT= from clobbering PORT_FOO=.
+    def persist_ports(env_body, ports)
+      ports.each do |key, val|
+        if env_body =~ /^#{key}=.*$/
+          env_body = env_body.sub(/^#{key}=.*$/, "#{key}=#{val}")
+        else
+          env_body += "\n" unless env_body.empty? || env_body.end_with?("\n")
+          env_body += "#{key}=#{val}\n"
+        end
+      end
+      env_body
     end
 
     # Upload rendered files atomically (write to .new, mv).
@@ -568,34 +418,117 @@ module LuxDeploy
       end
     end
 
-    BEFORE_LOCAL_HOOK ||= 'config/deploy/before_local.sh'
-    AFTER_SERVER_HOOK ||= 'config/deploy/after_server.sh'
+    LOCAL_BEFORE_HOOK  ||= 'config/deploy/local_before.sh'
+    REMOTE_BEFORE_HOOK ||= 'config/deploy/remote_before.sh'
+    REMOTE_AFTER_HOOK  ||= 'config/deploy/remote_after.sh'
+    LOCAL_AFTER_HOOK   ||= 'config/deploy/local_after.sh'
 
-    # Pre-flight gate. Runs locally in the project root before any remote
-    # work. Optional - skipped silently if the file isn't in the repo.
-    # Non-zero exit aborts the deploy.
-    def run_before_local_hook(ctx)
-      return unless File.exist?(BEFORE_LOCAL_HOOK)
-      step "run #{BEFORE_LOCAL_HOOK} (local)"
-      if ctx.ssh.dry_run
-        $stderr.puts "  [dry] bash #{BEFORE_LOCAL_HOOK}"
-        return
-      end
-      system('bash', BEFORE_LOCAL_HOOK) or
-        raise Error.new("#{BEFORE_LOCAL_HOOK} failed; deploy aborted (no remote state changed)")
+    # Hooks were renamed to a symmetric local_/remote_ scheme. Old names no
+    # longer fire - abort with a rename hint rather than silently skipping a
+    # hook the user believes still runs.
+    RENAMED_HOOKS ||= {
+      'config/deploy/before_local.sh'  => LOCAL_BEFORE_HOOK,
+      'config/deploy/before_server.sh' => REMOTE_BEFORE_HOOK,
+      'config/deploy/after_server.sh'  => REMOTE_AFTER_HOOK
+    }.freeze
+
+    def check_renamed_hooks!
+      stale = RENAMED_HOOKS.select { |old, _| File.exist?(old) }
+      return if stale.empty?
+      body = stale.map { |old, new| "  mv #{old} #{new}" }.join("\n")
+      raise Error.new("lifecycle hooks were renamed; rename these files:\n#{body}")
     end
 
-    # Post-deploy hook. Runs on the server inside release/ after the swap
-    # and service reload. Optional - skipped silently if absent. Non-zero
-    # exit warns but does NOT roll back (deploy is already live).
-    def run_after_server_hook(ctx)
-      return unless File.exist?(AFTER_SERVER_HOOK)
-      step "run #{AFTER_SERVER_HOOK} (server)"
-      ok = ctx.ssh.stream(
-        "cd #{Shellwords.escape(ctx.app_dir)}/release && bash #{Shellwords.escape(AFTER_SERVER_HOOK)}",
-        as: :service, allow_fail: true
+    # Pre-flight gate. Runs locally in the project root before any remote
+    # work. Optional - announced as "(not defined, skipping)" when the
+    # file is absent so a missing hook is visible in the output, not
+    # silent. Non-zero exit aborts the deploy.
+    def run_local_before_hook(ctx)
+      unless File.exist?(LOCAL_BEFORE_HOOK)
+        step "run #{LOCAL_BEFORE_HOOK} (not defined, skipping)"
+        return
+      end
+      step "run #{LOCAL_BEFORE_HOOK} (local)"
+      if ctx.ssh.dry_run
+        $stderr.puts "  [dry] bash #{LOCAL_BEFORE_HOOK}"
+        return
+      end
+      system('bash', LOCAL_BEFORE_HOOK) or
+        raise Error.new("#{LOCAL_BEFORE_HOOK} failed; deploy aborted (no remote state changed)")
+    end
+
+    # Install/migrate hook. Runs on the server inside new-release/ as the
+    # service user, AFTER rsync + symlinks + .env upload, BEFORE the swap.
+    # The rendered .env is sourced into the shell before the script runs
+    # so DB_URL / SECRET / etc. are exported. This is where the user does
+    # `bundle install`, `npm ci`, `go build`, db migrations, asset compile,
+    # etc. - the engine itself is language-agnostic past this point.
+    #
+    # Optional - announced as "(not defined, skipping)" when absent so the
+    # absence is visible. Non-zero exit aborts: the new-release/ dir is
+    # kept for inspection, release/ is untouched.
+    def run_remote_before_hook(ctx)
+      unless File.exist?(REMOTE_BEFORE_HOOK)
+        step "run #{REMOTE_BEFORE_HOOK} (not defined, skipping)"
+        return
+      end
+      step "run #{REMOTE_BEFORE_HOOK} (server, in new-release, .env sourced)"
+      ok = ctx.ssh.stream(<<~SH, as: :service, allow_fail: true)
+        set -e
+        cd #{Shellwords.escape(ctx.app_dir)}/new-release
+        #{env_source_sh('.env')}
+        bash #{Shellwords.escape(REMOTE_BEFORE_HOOK)}
+      SH
+      return if ok
+      raise Error.new(
+        "#{REMOTE_BEFORE_HOOK} failed; deploy aborted.\n" \
+        "  release/ untouched. new-release/ kept at #{ctx.app_dir}/new-release on #{ctx.host}.\n" \
+        "  Inspect: lux-deploy server:ssh   Retry hook: lux-deploy on:remote:before   Full redeploy: lux-deploy up"
       )
-      warn "#{AFTER_SERVER_HOOK} failed but deploy is already live; continuing" unless ok
+    end
+
+    # Post-deploy server hook. Runs on the server inside release/ after the
+    # swap and service reload, with the rendered .env sourced into the shell
+    # (same shape as the remote-before hook so both sides see the same
+    # exported vars). Optional - announced as "(not defined, skipping)"
+    # when absent so the absence is visible. Non-zero exit fails the command
+    # but does NOT roll back (deploy is already live).
+    def run_remote_after_hook(ctx)
+      unless File.exist?(REMOTE_AFTER_HOOK)
+        step "run #{REMOTE_AFTER_HOOK} (not defined, skipping)"
+        return
+      end
+      step "run #{REMOTE_AFTER_HOOK} (server, in release, .env sourced)"
+      ok = ctx.ssh.stream(<<~SH, as: :service, allow_fail: true)
+        set -e
+        cd #{Shellwords.escape(ctx.app_dir)}/release
+        #{env_source_sh('.env')}
+        bash #{Shellwords.escape(REMOTE_AFTER_HOOK)}
+      SH
+      return if ok
+      raise Error.new(
+        "#{REMOTE_AFTER_HOOK} failed.\n" \
+        "  Active release remains live at #{ctx.app_dir}/release on #{ctx.host}; no automatic rollback was attempted."
+      )
+    end
+
+    # Post-deploy local hook. Runs in the project root after the remote deploy
+    # succeeded and the manifest is written - notifications, cleanup of local
+    # build artifacts produced by local_before. Optional - announced as "(not
+    # defined, skipping)" when absent. Non-zero exit warns (deploy is live).
+    def run_local_after_hook(ctx, strict: false)
+      unless File.exist?(LOCAL_AFTER_HOOK)
+        step "run #{LOCAL_AFTER_HOOK} (not defined, skipping)"
+        return
+      end
+      step "run #{LOCAL_AFTER_HOOK} (local)"
+      if ctx.ssh.dry_run
+        $stderr.puts "  [dry] bash #{LOCAL_AFTER_HOOK}"
+        return
+      end
+      return if system('bash', LOCAL_AFTER_HOOK)
+      msg = "#{LOCAL_AFTER_HOOK} failed"
+      strict ? raise(Error.new(msg)) : warn("#{msg} but deploy is already live; continuing")
     end
 
     # Build + upload the post-deploy snapshot to <app_dir>/lux-deploy.yaml.
@@ -613,19 +546,12 @@ module LuxDeploy
     end
 
     def install_system_symlinks(ctx)
-      web_unit = web_unit(ctx)
-      ctx.ssh.run(<<~SH)
-        install -d #{CADDY_SITES} #{SYSTEMD_DIR}
-        ln -sfn #{Shellwords.escape(ctx.app_dir)}/systemd.service #{SYSTEMD_DIR}/#{web_unit}.service
-        ln -sfn #{Shellwords.escape(ctx.app_dir)}/caddy.config    #{CADDY_SITES}/#{ctx.app}.caddy
-      SH
-
-      if ctx.job_template?
-        job_unit = job_unit(ctx)
-        ctx.ssh.run(<<~SH)
-          ln -sfn #{Shellwords.escape(ctx.app_dir)}/systemd.job.service #{SYSTEMD_DIR}/#{job_unit}.service
-        SH
+      lines = ["install -d #{CADDY_SITES} #{SYSTEMD_DIR}"]
+      ctx.services.each do |s|
+        lines << "ln -sfn #{Shellwords.escape(ctx.app_dir)}/#{s.artifact} #{SYSTEMD_DIR}/#{s.unit}.service"
       end
+      lines << "ln -sfn #{Shellwords.escape(ctx.app_dir)}/caddy.config #{CADDY_SITES}/#{ctx.app}.caddy"
+      ctx.ssh.run(lines.join("\n"))
     end
   end
 end

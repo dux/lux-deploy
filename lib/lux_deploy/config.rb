@@ -4,7 +4,7 @@ module LuxDeploy
   # Single source of behavior for a deploy. Reads ./config/deploy/.yaml and
   # layers it on top of (a) engine defaults baked into this file and
   # (b) host-supplied defaults from LuxDeploy.defaults (set by a wrapping
-  # plugin/Hammerfile, e.g. lux-fw injects 'lux-web' / 'lux-apps' / smoke).
+  # plugin/Hammerfile, e.g. lux-fw injects 'lux-web' / 'lux-apps').
   #
   # Precedence (highest wins): user .yaml > LuxDeploy.defaults > ENGINE_DEFAULTS.
   class Config
@@ -12,8 +12,7 @@ module LuxDeploy
       'service_user'       => 'deployer',
       'remote_base'        => '/home/deployer/apps',
       'service_prefix'     => 'web',
-      'job_service_prefix' => nil,
-      'smoke_command'      => nil
+      'job_service_prefix' => nil
     }.freeze
 
     # Keys whose meaning is interpreted in Ruby - excluded from the
@@ -21,7 +20,7 @@ module LuxDeploy
     # `server` is also behavioral (target host) but historically exposed
     # as `{{SERVER}}` in caddy.conf, so it stays in template_vars.
     BEHAVIORAL_KEYS ||= %w[service_user remote_base service_prefix
-                           job_service_prefix smoke_command flavor].freeze
+                           job_service_prefix flavor src].freeze
 
     attr_reader :raw
 
@@ -43,8 +42,20 @@ module LuxDeploy
     def service_user       ; raw['service_user'].to_s ; end
     def remote_base        ; raw['remote_base'].to_s ; end
     def service_prefix     ; raw['service_prefix'].to_s ; end
+
+    # Local rsync source. Defaults to the project root; an app that builds a
+    # deploy artifact first (e.g. `lux pack` -> ./tmp/lux-app-cache in
+    # local_before) points `src:` at that dir. Trailing slash is forced so
+    # rsync ships the dir's contents, not the dir itself.
+    def src
+      v = raw['src'].to_s.strip
+      v = './' if v.empty?
+      v.end_with?('/') ? v : v + '/'
+    end
+    # Deprecated since 0.2.0 - services are now discovered from *.service
+    # files (a `job.service` deploys as <service_prefix>-<app>-job). Kept so
+    # an old .yaml that still sets it parses without error; no longer wired.
     def job_service_prefix ; v = raw['job_service_prefix']; v.to_s.empty? ? nil : v.to_s ; end
-    def smoke_command      ; v = raw['smoke_command'];      v.to_s.empty? ? nil : v.to_s ; end
 
     # Hash of UPPER_SYMBOL => string suitable for Template.render. Drops
     # behavioral keys (service_prefix etc.) so they don't pollute the

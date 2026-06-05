@@ -1,17 +1,13 @@
-# lux-deploy config. `server`, `domain`, and `smoke_command` are required.
+# lux-deploy config. `server` and `domain` are required.
 # Any non-behavioral key becomes an UPPERCASE {{KEY}} placeholder available
 # to every template under config/deploy/.
 
 server: srv.example.com
 domain: example.com
 
-# Smoke check. Runs in new-release/ after bundle install; non-zero exit
-# rolls the deploy back so the previous release keeps serving. Pick one
-# (or write your own - any command in any language, exit 0 = pass):
-smoke_command: bundle exec ruby -e "puts 'ok'"
-# smoke_command: bundle exec rails runner "puts 1"
-# smoke_command: bundle exec rspec spec/smoke
-# smoke_command: ./bin/smoke
+# Optional post-deploy verification now belongs in remote_after.sh.
+# If config/deploy/remote_after.sh exists and exits non-zero, the deploy
+# command fails after the new release is already live.
 
 # Engine defaults (uncomment to override):
 # service_user:       deployer

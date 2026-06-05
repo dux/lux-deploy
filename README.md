@@ -36,7 +36,6 @@ Required:
 ```yaml
 server:        srv.example.com
 domain:        example.com
-smoke_command: bundle exec ruby -e "puts 'ok'"   # see "Smoke" below
 ```
 
 Optional (defaults shown):
@@ -44,53 +43,55 @@ Optional (defaults shown):
 ```yaml
 service_user:       deployer                # unix user that owns the app dir
 remote_base:        /home/deployer/apps     # ~/<remote_base>/<app>/
-service_prefix:     web                     # systemd unit: <prefix>-<app>.service
-job_service_prefix:                         # nil = no job service
+service_prefix:     web                     # systemd units: <prefix>-<app>[-<svc>]
 ```
 
 Any other key becomes an UPPERCASE `{{KEY}}` placeholder available to every
 template under `config/deploy/`.
 
-### Smoke
+### Post-deploy verification
 
-`smoke_command` runs inside `new-release/` after `bundle install` and
-before the atomic swap. Exit 0 = release goes live; non-zero = roll back
-(`new-release/` is wiped, the previous `release/` keeps serving).
+Put smoke checks in `config/deploy/remote_after.sh`. It runs on the
+server inside `release/` after the atomic swap and service reload, with
+the rendered `.env` already sourced. If the file exists and exits
+non-zero, `lux-deploy up` exits failed. The new release is already live,
+so lux-deploy does not automatically roll it back.
 
-It is **mandatory**. There is no "skip" — the entire point of the deploy
-gate is to be unskippable. The command can be anything that exits with a
-proper code: a ruby boot-eval, an rspec invocation, a shell script, a
-python test, a `curl` against a sidecar, whatever. Examples:
+Use any command in any language: a ruby boot-eval, an rspec invocation,
+a shell script, a python test, a `curl` against the deployed URL, etc.
+You can re-run it directly with `lux-deploy on:remote:after`.
 
-```yaml
-smoke_command: bundle exec lux e 1                  # lux: boot framework, eval 1
-smoke_command: bundle exec rails runner "puts 1"    # rails: boot app
-smoke_command: bundle exec rspec spec/smoke         # tagged smoke specs
-smoke_command: bundle exec rake smoke               # custom rake task
-smoke_command: ./bin/smoke                          # shell script
-smoke_command: pytest tests/smoke                   # not even ruby
-```
+### Lifecycle hooks: `local_before` / `remote_before` / `remote_after` / `local_after`
 
-If your smoke needs gems excluded by `--without 'development test'`,
-either move them into a different bundler group or write your smoke to
-not depend on them.
-
-### Lifecycle hooks: `before_local.sh` / `after_server.sh`
-
-Optional scripts in `config/deploy/`. The filename suffix is the contract:
-`_local` runs on your machine, `_server` runs on the production box.
-Skipped silently when absent. `app:init` ships empty scaffolds with
-explanatory header comments; `doctor` reports which are present.
+Optional scripts in `config/deploy/`. The name is the contract:
+`local_*` runs on your machine, `remote_*` runs on the production box;
+`*_before` runs before the swap, `*_after` runs after it.
+Every hook slot is announced on every deploy - missing hooks log
+`==> run config/deploy/<name> (not defined, skipping)` so absence is
+visible, not silent. `app:init` ships scaffolds; `doctor` reports which
+are present.
 
 | file | where | when | failure |
 | --- | --- | --- | --- |
-| `before_local.sh` | local repo root | before any remote work (right after context build) | abort - no remote state changed |
-| `after_server.sh` | server `release/` | after atomic swap, service reload, job restart | warn - new release is already live |
+| `local_before.sh`  | local repo root        | before any remote work (right after context build)                          | abort - no remote state changed |
+| `remote_before.sh` | server `new-release/`  | after rsync + .env upload, `.env` already sourced; before swap              | abort - `new-release/` kept, `release/` untouched |
+| `remote_after.sh`  | server `release/`      | after atomic swap + service reload, `.env` sourced                          | fail - new release is already live |
+| `local_after.sh`   | local repo root        | after the manifest is written and the deploy is live                        | warn - new release is already live |
 
-Lives in the repo, rsync'd to the server with everything else. The server
-has no special awareness of these files - lux-deploy itself runs the
-named hook on the named side. `before_local.sh` ends up on the server too
-but is never executed there.
+`remote_before.sh` is where you do the language-specific work -
+`bundle install`, `npm ci`, `go build`, migrations, asset compile. The
+engine does not run any of those itself; the `app:init` scaffold ships a
+working Ruby/Bundler default that you can edit or replace. `local_after.sh`
+is the natural place to clean up whatever `local_before.sh` built (e.g.
+`vendor/cache`) or to fire a post-deploy notification.
+
+The `remote_*` hooks live in the repo and are rsync'd to the server with
+everything else. The server has no special awareness of these files -
+lux-deploy itself runs the named hook on the named side. The `local_*`
+hooks ride along to the server too but are never executed there.
+
+> Renamed in 0.2.0 (was `before_local` / `before_server` / `after_server`).
+> `up` aborts with a `mv` hint if it finds an old-named hook.
 
 ### Wrapping lux-deploy from another gem / Hammerfile
 
@@ -104,9 +105,7 @@ LuxDeploy::Hammer.register(
   templates_dir: File.expand_path('templates', __dir__),
   defaults: {
     service_prefix:     'lux-web',
-    job_service_prefix: 'lux-job',
-    remote_base:        '/home/deployer/lux-apps',
-    smoke_command:      'bundle exec lux e 1'
+    remote_base:        '/home/deployer/lux-apps'
   }
 )
 ```
@@ -118,23 +117,21 @@ Precedence: user `.yaml` > plugin `defaults` > engine defaults.
 | command                | purpose |
 | ---------------------- | ------- |
 | `lux-deploy up`        | deploy current branch |
-| `lux-deploy redeploy`  | destroy + deploy (fresh PORT) |
+| `lux-deploy redeploy`  | destroy + deploy (fresh PORTs) |
 | `lux-deploy destroy`   | stop service, unlink caddy/systemd, remove `~/<remote_base>/<app>` |
 | `lux-deploy doctor`    | check & prepare host (deployer user, dirs, caddy, ruby, bundler) |
 | `lux-deploy app:init`  | copy bundled templates into `./config/deploy/` |
+| `lux-deploy on:local:before`  | run `config/deploy/local_before.sh` locally |
+| `lux-deploy on:remote:before` | run `config/deploy/remote_before.sh` on `new-release/` |
+| `lux-deploy on:remote:after`  | run `config/deploy/remote_after.sh` on `release/` |
+| `lux-deploy on:local:after`   | run `config/deploy/local_after.sh` locally |
 | `lux-deploy server:ssh`     | open a shell on the release dir |
 | `lux-deploy server:log`     | tail the systemd journal |
+| `lux-deploy server:errors`  | tail -f the app error log |
 | `lux-deploy server:restart` | restart the web service |
 | `lux-deploy server:status`  | systemd status |
-| `lux-deploy db:psql`        | open remote psql via DB_URL |
-| `lux-deploy db:pull`        | alias of `db:pg:pull` |
-| `lux-deploy db:pg:check`    | print remote DB info: name, size, public table count, version |
-| `lux-deploy db:pg:create`   | `CREATE DATABASE` for the dbname in remote `.env DB_URL` |
-| `lux-deploy db:pg:destroy`  | `DROP DATABASE` on remote (type-domain to confirm) |
-| `lux-deploy db:pg:backup`   | `pg_dump` remote -> `./tmp/<app>-<ts>.sql.gz` |
-| `lux-deploy db:pg:pull`     | `pg_dump` remote, restore into local `$DB_URL` |
-| `lux-deploy db:pg:push`     | `pg_dump` local `$DB_URL`, restore into remote (type-domain to confirm) |
-| `lux-deploy db:pg:transfer` | server-to-server: `--from HOST` -> `--server` via local relay (type-domain to confirm) |
+
+Database tasks live in `lux db:*` from lux-fw's `db` plugin and run against the local app DB.
 
 Common flags:
 
@@ -151,13 +148,53 @@ config/deploy/
   .env                   # production env (used on master/main)
   .env.staging           # staging env (used on any other branch)
   caddy.conf             # caddy site file
-  systemd.service        # systemd unit for the web server
-  job.service            # optional: systemd unit for the job runner
+  systemd.service        # the web service (caddy-fronted)
+  <name>.service         # optional: any extra service (job runner, grpc, ...)
 ```
 
 The two required keys are `server` and `domain`. Any additional key
 becomes an UPPERCASE `{{KEY}}` placeholder available to every template
 (e.g. add `cdn: cdn.example.com` and use `{{CDN}}` in caddy.conf).
+
+### Multiple services & ports
+
+A **service is a file**: `systemd.service` is the web service (the one
+caddy proxies to); every other `config/deploy/<name>.service` becomes a
+second systemd unit `<service_prefix>-<app>-<name>`, enabled and restarted
+on each deploy. No list to maintain - drop a file, it deploys; remove it
+and `destroy` no longer knows about it (clean the unit up by hand once).
+
+**Disable without deleting**: prefix any file with `!` and lux-deploy
+ignores it everywhere - `!job.service` stops deploying as a service, and the
+`!`-file is never rsynced. The convention is global: any `!`-prefixed file
+in the repo (e.g. `!scratch.rb`) is excluded from the deploy. A `!`-disabled
+service is *not* torn down automatically - stop its unit on the box once
+(`systemctl disable --now <service_prefix>-<app>-<name>`).
+
+**Ports are magic**: any token matching `PORT*` is auto-allocated, persisted
+into the remote `.env` (0600), and reused on every later deploy. The set is
+the union of `PORT*` keys in `.env`/`.env.staging` and `{{PORT*}}`
+placeholders in any template. So a worker that needs its own port just
+references `{{PORT_JOB}}` in its unit (and/or declares `PORT_JOB=` in
+`.env`); the web service keeps its single `{{PORT}}`. The host is only
+probed for free ports when something new must be allocated - reuse never
+touches the network.
+
+```
+# config/deploy/.env            after first deploy (persisted on server):
+PORT=                           PORT=3010
+PORT_JOB=                       PORT_JOB=3020
+```
+
+### Polyglot
+
+Nothing here is Ruby-specific. `{{RUBY}}`/`{{RUBY_DIR}}` (and the ruby
+probe) are only resolved when a template actually references them - a Go or
+Python service whose unit runs a built binary (`ExecStart={{DIR}}/release/app`)
+never triggers the probe, and `doctor` skips the ruby/bundler host checks.
+Build your app however you like in `remote_before.sh` (`go build`,
+`pip install`, `npm ci`, `bundle install`); post-deploy verification goes
+in `remote_after.sh` and fails the command by exiting non-zero.
 
 ## Server layout
 
@@ -171,10 +208,10 @@ becomes an UPPERCASE `{{KEY}}` placeholder available to every template
   shared/
     tmp/                   # survives release swap
     log/                   # survives release swap
-  .env                     # rendered, PORT lives here (0600)
-  systemd.service          # rendered; linked into /etc/systemd/system/<prefix>-<app>.service
+  .env                     # rendered, PORT* live here (0600)
+  systemd.service          # rendered web unit; linked to /etc/systemd/system/<prefix>-<app>.service
+  systemd.<name>.service   # rendered extra unit; linked to /etc/systemd/system/<prefix>-<app>-<name>.service
   caddy.config             # rendered; linked into /etc/caddy/sites/<app>.caddy
-  systemd.job.service      # optional; linked into /etc/systemd/system/<job-prefix>-<app>.service
   lux-deploy.yaml          # post-deploy manifest, mode 0644 (see below)
 ```
 
@@ -184,9 +221,9 @@ becomes an UPPERCASE `{{KEY}}` placeholder available to every template
 ## Manifest: `lux-deploy.yaml`
 
 Every successful `up` writes a `lux-deploy.yaml` next to `.env` on the
-remote. It is a self-describing snapshot of what is wired up: services,
-unit names, caddy paths, allocated port, git commit, ExecStart lines,
-non-secret env values, and a few ready-to-paste shell helpers
+remote. It is a self-describing snapshot of what is wired up: every
+service, its unit name and ExecStart, caddy paths, allocated ports, git
+commit, non-secret env values, and a few ready-to-paste shell helpers
 (`systemctl restart ...`, `journalctl -u ...`, `systemctl reload caddy`).
 
 It is mode 0644 and never contains secrets: any key matching
@@ -199,49 +236,71 @@ commands. Regenerated on every deploy, removed with the app dir on
 
 ## Template substitution
 
-`{{VAR}}` placeholders inside any template are replaced from:
+Every template (`.env`, `.env.staging`, `caddy.conf`, and each
+`*.service` unit) is rendered in a single pass with the same vars:
 
 1. **Git** (computed locally): `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`
-2. **`.yaml`**: every non-behavioral key uppercased -- `{{SERVER}}`, `{{DOMAIN}}`, etc.
-3. **Server probe**: `{{PORT}}` -- reused from existing `.env`, or
-   first free port in `3010..3990` step 10 (via `ss -tln`)
-4. **Derived**: `{{DIR}}`, `{{RUBY}}`, `{{RUBY_DIR}}`
-5. **The rendered `.env`** itself: every `KEY=VAL` line becomes a placeholder
-   you can use in `caddy.conf` / `systemd.service` (e.g. `{{DOMAIN}}`)
+2. **App** (derived from `domain:`): `{{APP}}`, `{{APP_UNDERSCORE}}`,
+   `{{HASH}}` (`h` + first 6 SHA-256 hex chars of the main domain),
+   `{{TAG}}` (`s` + first 5 SHA-256 hex chars of the main domain)
+3. **`.yaml`**: every non-behavioral key uppercased -- `{{SERVER}}`, `{{DOMAIN}}`, etc.
+4. **Ports**: `{{PORT}}` and any `{{PORT_*}}` -- reused from the existing
+   `.env`, or first free ports in `3010..3990` step 10 (via `ss -tln`)
+5. **Derived**: `{{DIR}}`, plus `{{RUBY}}`/`{{RUBY_DIR}}` only when a
+   template references them
 
-Order: render `.env` first, parse it, then render the other templates with
-the resulting env hash merged in.
+`.env` does **not** feed back into the placeholder namespace. It is a
+runtime-only file -- rendered once, uploaded verbatim, and read by the
+running app at boot. `caddy.conf` / `systemd.service` cannot reference
+keys defined inside `.env`; if you need a value in both places put it
+in `.yaml` (so it becomes `{{KEY}}`) and the app's `.env` can reference
+the same `{{KEY}}` if you want it duplicated there.
 
-Behavioral keys (`service_user`, `remote_base`, `service_prefix`,
-`job_service_prefix`, `smoke_command`) are excluded from the placeholder
-namespace - they configure the engine, not the templates.
+Behavioral keys (`service_user`, `remote_base`, `service_prefix`) are
+excluded from the placeholder namespace - they configure the engine, not
+the templates. `PORT*` are engine-provided, so units/caddy may reference
+`{{PORT_*}}` without declaring them in `.yaml`.
 
 ## Deploy flow
 
 ```
  1. read config/deploy/.yaml (merged: engine defaults < plugin defaults < user .yaml)
- 2. pick template:  master|main -> .env, anything else -> .env.staging
- 3. render .env -> derive <app> from DOMAIN (falls back to .yaml domain)
- 4. before_local.sh   (LOCAL, if present; non-zero exit -> abort)
+ 2. derive <app> from yaml `domain:` (first comma-split, strip leading "*.")
+ 3. pick .env template: master|main -> .env, anything else -> .env.staging
+ 4. local_before.sh   (LOCAL, if present; non-zero exit -> abort)
  5. ensure remote dirs (service_user-owned)
- 6. allocate / reuse PORT
- 7. rsync code to new-release/
- 8. symlink tmp, log, .env into new-release/
- 9. upload rendered .env / systemd.service / caddy.config
-10. bundle install (vendor/bundle, without development+test)
-11. smoke (config.smoke_command; abort + cleanup on failure)
-12. atomic swap:  rm old-release; mv release old-release; mv new-release release
-13. install symlinks under /etc/systemd/system and /etc/caddy/sites
-14. systemctl daemon-reload + restart web + reload caddy
-15. (if job.service present) restart <job-prefix>-<app>
-16. after_server.sh   (SERVER, if present; non-zero exit -> warn, do not roll back)
+ 6. wipe stale new-release/ (from a prior failed deploy, if any)
+ 7. allocate / reuse every PORT*
+ 8. render templates (.env, caddy.conf, each *.service unit)
+
+ 9. rsync code to new-release/
+10. symlink tmp, log, .env into new-release/
+11. upload rendered .env / *.service / caddy.config
+12. remote_before.sh  (SERVER, in new-release/, .env sourced; abort on failure -- new-release/ kept for inspection)
+                       This is where your app installs gems / npm / go build / migrations / asset compile.
+                       lux-deploy ships nothing language-specific past this point.
+13. atomic swap:  rm old-release; mv release old-release; mv new-release release
+14. install symlinks under /etc/systemd/system and /etc/caddy/sites
+15. systemctl daemon-reload + enable/restart every service + reload caddy
+16. remote_after.sh   (SERVER, in release/, .env sourced; non-zero exit -> fail, no auto rollback)
 17. write <app_dir>/lux-deploy.yaml (manifest)
+18. local_after.sh    (LOCAL, if present; non-zero exit -> warn, deploy is already live)
 ```
 
-On any failure between step 7 and step 12, `release/` is untouched.
+Every lifecycle hook step is always announced - if the file is missing
+the line reads e.g. `==> run config/deploy/local_before.sh (not defined, skipping)`
+so absence is visible, not silent.
+
+On any failure between step 9 and step 12, `release/` is untouched and
+`new-release/` is left in place on the server (path printed in the
+error). `lux-deploy server:ssh` to inspect; the next `lux-deploy up`
+wipes `new-release/` at step 6. Run `lux-deploy on:remote:before` to
+re-run the server-side pre-swap hook against the current `new-release/`.
+If `remote_after.sh` fails at step 16, the command fails but the new
+release is already live.
 
 ## Notes
 
 * `lux-deploy destroy` prompts `type '<domain>' to confirm` unless `--yes`.
-* `lux-deploy redeploy` always allocates a fresh PORT.
+* `lux-deploy redeploy` wipes the app dir, so all `PORT*` are re-allocated fresh.
 * Concurrent deploys for the same app are not locked. Don't.

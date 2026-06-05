@@ -13,9 +13,7 @@ module LuxDeploy
   #     templates_dir: '/abs/path/to/plugin/templates',
   #     defaults: {
   #       service_prefix: 'lux-web',
-  #       job_service_prefix: 'lux-job',
   #       remote_base: '/home/deployer/lux-apps',
-  #       smoke_command: 'bundle exec lux e 1'
   #     }
   #   )
   #
@@ -50,7 +48,7 @@ module LuxDeploy
     # deploy template fallback both see it.
     def define_on(target, tdir)
       target.task :up do
-        desc 'Deploy current branch (rsync, bundle, smoke, swap, restart)'
+        desc 'Deploy current branch (rsync, hooks, swap, restart)'
         opt :server,  desc: 'Override hostname from config/deploy/.yaml'
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
 
@@ -83,9 +81,43 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.doctor(opts) } }
       end
 
+      target.task :log do
+        desc 'List server logs, or dump one with --log <name> (--lines 200)'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        opt :log,    desc: 'Log name to dump (e.g. errors, exceptions); omit to list all logs'
+        opt :lines,  default: 200, desc: 'Lines to show when dumping a log (default 200)'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.log(opts.merge(templates_dir: tdir)) } }
+      end
+
       target.namespace(:app)    { LuxDeploy::Hammer.define_app_on(self, tdir) }
       target.namespace(:server) { LuxDeploy::Hammer.define_server_on(self, tdir) }
-      target.namespace(:db)     { LuxDeploy::Hammer.define_db_on(self, tdir) }
+      target.namespace(:on)     { LuxDeploy::Hammer.define_on_hooks_on(self, tdir) }
+    end
+
+    def define_on_hooks_on(target, tdir)
+      target.namespace(:remote) do
+        LuxDeploy::Hammer.define_hook_task_on(self, :before, :remote, :before, tdir, 'Run config/deploy/remote_before.sh on new-release/')
+        LuxDeploy::Hammer.define_hook_task_on(self, :after, :remote, :after, tdir, 'Run config/deploy/remote_after.sh on release/')
+      end
+
+      target.namespace(:local) do
+        LuxDeploy::Hammer.define_hook_task_on(self, :before, :local, :before, tdir, 'Run config/deploy/local_before.sh locally')
+        LuxDeploy::Hammer.define_hook_task_on(self, :after, :local, :after, tdir, 'Run config/deploy/local_after.sh locally')
+      end
+    end
+
+    def define_hook_task_on(target, task_name, side, timing, tdir, description)
+      target.task task_name do
+        desc description
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+
+        proc { |opts|
+          LuxDeploy::Hammer.safe(opts) {
+            LuxDeploy::Commands.hook(opts.merge(templates_dir: tdir), side, timing)
+          }
+        }
+      end
     end
 
     def define_app_on(target, tdir)
@@ -113,6 +145,12 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.server_log(opts.merge(templates_dir: tdir)) } }
       end
 
+      target.task :errors do
+        desc 'Tail -f the app error log (release/log/error.log)'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.server_errors(opts.merge(templates_dir: tdir)) } }
+      end
+
       target.task :restart do
         desc 'systemctl restart the web service'
         opt :server, desc: 'Override hostname from config/deploy/.yaml'
@@ -126,70 +164,5 @@ module LuxDeploy
       end
     end
 
-    def define_db_on(target, tdir)
-      target.task :psql do
-        desc 'Open remote psql using DB_URL from server .env'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_psql(opts.merge(templates_dir: tdir)) } }
-      end
-
-      # Deprecated thin alias of db:pg:pull. Kept so existing muscle memory
-      # and scripts keep working; new code should use db:pg:pull.
-      target.task :pull do
-        desc '[alias] db:pg:pull'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_pull(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.namespace(:pg) { LuxDeploy::Hammer.define_db_pg_on(self, tdir) }
-    end
-
-    def define_db_pg_on(target, tdir)
-      target.task :check do
-        desc 'Print remote DB info: name, size, public table count, version'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_check(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :create do
-        desc 'CREATE DATABASE on remote (db name parsed from .env DB_URL)'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_create(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :destroy do
-        desc 'DROP DATABASE on remote (type domain to confirm)'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        opt :yes,    type: :boolean, default: false, desc: 'Skip type-domain confirmation'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_destroy(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :backup do
-        desc 'pg_dump remote -> ./tmp/<app>-<timestamp>.sql.gz (no restore)'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_backup(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :pull do
-        desc 'pg_dump remote DB and restore into local $DB_URL (drops + recreates local)'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_pull(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :push do
-        desc 'pg_dump local $DB_URL and restore into remote (drops + recreates remote)'
-        opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        opt :yes,    type: :boolean, default: false, desc: 'Skip type-domain confirmation'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_push(opts.merge(templates_dir: tdir)) } }
-      end
-
-      target.task :transfer do
-        desc 'Copy DB from --from HOST to --server (or default), drops + recreates target'
-        opt :from,   desc: 'Source server hostname (required)'
-        opt :server, desc: 'Target server (defaults to config/deploy/.yaml server:)'
-        opt :yes,    type: :boolean, default: false, desc: 'Skip type-domain confirmation'
-        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.db_pg_transfer(opts.merge(templates_dir: tdir)) } }
-      end
-    end
   end
 end

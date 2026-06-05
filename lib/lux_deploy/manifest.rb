@@ -12,9 +12,15 @@ module LuxDeploy
     FILENAME ||= 'lux-deploy.yaml'
 
     # Keys whose values are stripped from the env section. Matched on the
-    # uppercased key name, substring (so SECRET, JWT_SECRET, DB_URL,
-    # DATABASE_URL, MY_API_TOKEN, AWS_ACCESS_KEY_ID all redact).
-    SENSITIVE_KEY_PATTERNS ||= %w[SECRET PASSWORD TOKEN KEY DB_URL DATABASE_URL CREDENTIAL].freeze
+    # uppercased key name, substring (so SECRET, JWT_SECRET, DB_MAIN, DB_URL,
+    # DATABASE_URL, MY_API_TOKEN, AWS_ACCESS_KEY_ID all redact). As a backstop,
+    # any value carrying URL-embedded credentials (user:pass@) is redacted
+    # regardless of key name - see sensitive_value?.
+    SENSITIVE_KEY_PATTERNS ||= %w[SECRET PASSWORD TOKEN KEY DB_MAIN DB_URL DATABASE_URL CREDENTIAL].freeze
+
+    # Value carrying URL-embedded credentials, e.g. postgres://user:pass@host/db
+    # or password-only forms like redis://:pass@host (empty username).
+    CREDENTIAL_URL ||= %r{://[^/\s:@]*:[^/\s@]+@}
 
     # Returns the YAML body ready to upload (with a header comment).
     def render(ctx)
@@ -27,14 +33,12 @@ module LuxDeploy
     end
 
     def build(ctx)
-      web_unit = "#{ctx.config.service_prefix}-#{ctx.app}"
-      job_unit = (ctx.config.job_service_prefix && ctx.job_template?) \
-                   ? "#{ctx.config.job_service_prefix}-#{ctx.app}" \
-                   : nil
-
-      env = Template.parse_env(ctx.rendered['.env'])
-      domains = env[:DOMAIN].to_s.split(',').map(&:strip).reject(&:empty?)
-      exec_start = extract_directive(ctx.rendered['systemd.service'], 'ExecStart')
+      # Domains come from yaml `domain:` (the sole source of truth post
+      # .env/.yaml split). env_snapshot is a redacted snapshot of the
+      # rendered .env contents - informational only, never used for
+      # template substitution.
+      domains      = ctx.config.domain.to_s.split(',').map(&:strip).reject(&:empty?)
+      env_snapshot = Template.parse_env(ctx.rendered['.env'])
 
       {
         deployed_at:  Time.now.utc.iso8601,
@@ -49,7 +53,8 @@ module LuxDeploy
           service_user: ctx.config.service_user,
           app_dir:      ctx.app_dir,
           port:         ctx.port,
-          ruby:         ctx.ruby_path
+          ports:        ctx.ports,
+          ruby:         (ctx.ruby_used? ? ctx.ruby_path : nil)
         },
         paths: {
           release:     "#{ctx.app_dir}/release",
@@ -60,14 +65,14 @@ module LuxDeploy
           env_file:    "#{ctx.app_dir}/.env",
           manifest:    "#{ctx.app_dir}/#{FILENAME}"
         },
-        services: services_section(ctx, web_unit, job_unit, exec_start),
+        services: services_section(ctx),
         caddy: {
           site_link: "#{CADDY_SITES}/#{ctx.app}.caddy",
           source:    "#{ctx.app_dir}/caddy.config",
           reload:    'systemctl reload caddy'
         },
         hooks:     hooks_section,
-        env:       env_section(env),
+        env:       env_section(env_snapshot),
         artifacts: ctx.rendered.keys.sort,
         engine: {
           lux_deploy_version: LuxDeploy::VERSION,
@@ -77,38 +82,30 @@ module LuxDeploy
       }
     end
 
-    def services_section(ctx, web_unit, job_unit, exec_start)
-      out = {
-        web: {
-          unit:         "#{web_unit}.service",
-          systemd_link: "#{SYSTEMD_DIR}/#{web_unit}.service",
-          source:       "#{ctx.app_dir}/systemd.service",
-          exec_start:   exec_start,
-          restart:      "systemctl restart #{web_unit}",
-          logs:         "journalctl -u #{web_unit} -n 200 -f"
-        }
-      }
-      if job_unit
-        job_exec = extract_directive(ctx.rendered['systemd.job.service'], 'ExecStart')
-        out[:job] = {
-          unit:         "#{job_unit}.service",
-          systemd_link: "#{SYSTEMD_DIR}/#{job_unit}.service",
-          source:       "#{ctx.app_dir}/systemd.job.service",
-          exec_start:   job_exec,
-          restart:      "systemctl restart #{job_unit}",
-          logs:         "journalctl -u #{job_unit} -n 200 -f"
+    # One block per discovered service (web + every extra *.service), keyed
+    # by service name. ExecStart is pulled from each rendered unit.
+    def services_section(ctx)
+      ctx.services.each_with_object({}) do |s, out|
+        out[s.name] = {
+          unit:         "#{s.unit}.service",
+          systemd_link: "#{SYSTEMD_DIR}/#{s.unit}.service",
+          source:       "#{ctx.app_dir}/#{s.artifact}",
+          exec_start:   extract_directive(ctx.rendered[s.artifact], 'ExecStart'),
+          restart:      "systemctl restart #{s.unit}",
+          logs:         "journalctl -u #{s.unit} -n 200 -f"
         }
       end
-      out
     end
 
     # Lifecycle hook presence. Reflects what was on the local repo at
-    # deploy time - before_local.sh runs locally so it never lands on the
-    # server, after_server.sh rides along with the rsync.
+    # deploy time - local_* hooks run on your machine, remote_* ride along
+    # with the rsync and run on the server.
     def hooks_section
       {
-        before_local: File.exist?(Commands::BEFORE_LOCAL_HOOK) ? Commands::BEFORE_LOCAL_HOOK : nil,
-        after_server: File.exist?(Commands::AFTER_SERVER_HOOK) ? Commands::AFTER_SERVER_HOOK : nil
+        local_before:  File.exist?(Commands::LOCAL_BEFORE_HOOK)  ? Commands::LOCAL_BEFORE_HOOK  : nil,
+        remote_before: File.exist?(Commands::REMOTE_BEFORE_HOOK) ? Commands::REMOTE_BEFORE_HOOK : nil,
+        remote_after:  File.exist?(Commands::REMOTE_AFTER_HOOK)  ? Commands::REMOTE_AFTER_HOOK  : nil,
+        local_after:   File.exist?(Commands::LOCAL_AFTER_HOOK)   ? Commands::LOCAL_AFTER_HOOK   : nil
       }
     end
 
@@ -117,13 +114,17 @@ module LuxDeploy
     # sees the variable exists.
     def env_section(env)
       env.each_with_object({}) do |(k, v), h|
-        h[k] = sensitive?(k) ? '<redacted>' : v
+        h[k] = (sensitive?(k) || sensitive_value?(v)) ? '<redacted>' : v
       end
     end
 
     def sensitive?(key)
       up = key.to_s.upcase
       SENSITIVE_KEY_PATTERNS.any? { |pat| up.include?(pat) }
+    end
+
+    def sensitive_value?(value)
+      value.to_s.match?(CREDENTIAL_URL)
     end
 
     def git_info(branch)
