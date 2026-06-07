@@ -119,6 +119,32 @@ module LuxDeploy
       Doctor.run(ssh, config, fix: opts.fetch(:fix, true))
     end
 
+    # -------- prepare:caddy / prepare:nginx -------------------------------
+
+    # Bootstrap the reverse proxy on the host (install, sites dir, directive,
+    # enable). Host setup only - the deploy flow stays caddy-fronted. Builds
+    # ssh directly from host + config (no app/domain resolution needed).
+
+    def prepare_caddy(opts)
+      ssh = prepare_ssh(opts)
+      step "prepare caddy on #{ssh.host}"
+      Prepare.caddy(ssh)
+      step "done. caddy installed, #{CADDY_SITES} wired, service running"
+    end
+
+    def prepare_nginx(opts)
+      ssh = prepare_ssh(opts)
+      step "prepare nginx on #{ssh.host}"
+      Prepare.nginx(ssh)
+      step 'done. nginx installed, sites-enabled wired, service running'
+    end
+
+    def prepare_ssh(opts)
+      config = Config.load
+      SSH.new(Context.read_host(opts), service_user: config.service_user,
+                                       dry_run: opts[:dry_run] || false)
+    end
+
     # -------- app:init ----------------------------------------------------
 
     # Copy every shipped template into ./config/deploy/. Existing files are

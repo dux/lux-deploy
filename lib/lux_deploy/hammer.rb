@@ -89,9 +89,10 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.log(opts.merge(templates_dir: tdir)) } }
       end
 
-      target.namespace(:app)    { LuxDeploy::Hammer.define_app_on(self, tdir) }
-      target.namespace(:server) { LuxDeploy::Hammer.define_server_on(self, tdir) }
-      target.namespace(:on)     { LuxDeploy::Hammer.define_on_hooks_on(self, tdir) }
+      target.namespace(:app)     { LuxDeploy::Hammer.define_app_on(self, tdir) }
+      target.namespace(:server)  { LuxDeploy::Hammer.define_server_on(self, tdir) }
+      target.namespace(:on)      { LuxDeploy::Hammer.define_on_hooks_on(self, tdir) }
+      target.namespace(:prepare) { LuxDeploy::Hammer.define_prepare_on(self, tdir) }
     end
 
     def define_on_hooks_on(target, tdir)
@@ -129,6 +130,22 @@ module LuxDeploy
             LuxDeploy::Commands.init(opts.merge(templates_dir: opts[:from] || tdir))
           }
         }
+      end
+    end
+
+    def define_prepare_on(target, _tdir)
+      target.task :caddy do
+        desc 'Install + configure Caddy on the host (sites dir, import, enable)'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_caddy(opts) } }
+      end
+
+      target.task :nginx do
+        desc 'Install + configure nginx on the host (sites-enabled, enable)'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_nginx(opts) } }
       end
     end
 

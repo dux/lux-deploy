@@ -44,9 +44,8 @@ module LuxDeploy
     def service_prefix     ; raw['service_prefix'].to_s ; end
 
     # Local rsync source. Defaults to the project root; an app that builds a
-    # deploy artifact first (e.g. `lux pack` -> ./tmp/lux-app-cache in
-    # local_before) points `src:` at that dir. Trailing slash is forced so
-    # rsync ships the dir's contents, not the dir itself.
+    # deploy artifact first can point `src:` at that build dir. Trailing slash
+    # is forced so rsync ships the dir's contents, not the dir itself.
     def src
       v = raw['src'].to_s.strip
       v = './' if v.empty?

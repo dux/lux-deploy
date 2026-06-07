@@ -121,6 +121,8 @@ Precedence: user `.yaml` > plugin `defaults` > engine defaults.
 | `lux-deploy destroy`   | stop service, unlink caddy/systemd, remove `~/<remote_base>/<app>` |
 | `lux-deploy doctor`    | check & prepare host (deployer user, dirs, caddy, ruby, bundler) |
 | `lux-deploy app:init`  | copy bundled templates into `./config/deploy/` |
+| `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
+| `lux-deploy prepare:nginx` | install + configure nginx on the host (sites-enabled, enable) |
 | `lux-deploy on:local:before`  | run `config/deploy/local_before.sh` locally |
 | `lux-deploy on:remote:before` | run `config/deploy/remote_before.sh` on `new-release/` |
 | `lux-deploy on:remote:after`  | run `config/deploy/remote_after.sh` on `release/` |
