@@ -36,9 +36,11 @@ bundle exec lux-deploy up            # ship it
 run once per server (it is idempotent, so re-running is safe):
 
 ```sh
-lux-deploy prepare:caddy   # install Caddy, create /etc/caddy/sites, wire the import, enable
-lux-deploy prepare:nginx   # install nginx, create sites-enabled, wire the include, enable
-lux-deploy prepare:mise    # install mise for the service user, activate it in the login shell
+lux-deploy prepare:caddy     # install Caddy, create /etc/caddy/sites, wire the import, enable
+lux-deploy prepare:nginx     # install nginx, create sites-enabled, wire the include, enable
+lux-deploy prepare:mise      # install mise for the service user, activate it in the login shell
+lux-deploy prepare:bun       # install Bun for the service user
+lux-deploy caddy:log:prepare # install Bun + the host-wide access-log -> SQLite importer
 ```
 
 The proxy tasks target Debian/Ubuntu (apt) and run as root over SSH. This is
@@ -149,6 +151,9 @@ Precedence: user `.yaml` > plugin `defaults` > engine defaults.
 | `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
 | `lux-deploy prepare:nginx` | install + configure nginx on the host (sites-enabled, enable) |
 | `lux-deploy prepare:mise` | install mise for the service user + activate it in the login shell |
+| `lux-deploy prepare:bun` | install Bun for the service user |
+| `lux-deploy caddy:log:prepare` | install Bun + the host-wide access-log -> SQLite importer |
+| `lux-deploy caddy:log:status` | importer service status + this app's SQLite stats |
 | `lux-deploy on:local:before`  | run `config/deploy/local_before.sh` locally |
 | `lux-deploy on:remote:before` | run `config/deploy/remote_before.sh` on `new-release/` |
 | `lux-deploy on:remote:after`  | run `config/deploy/remote_after.sh` on `release/` |
@@ -236,6 +241,9 @@ in `remote_after.sh` and fails the command by exiting non-zero.
   shared/
     tmp/                   # survives release swap
     log/                   # survives release swap
+  log/                     # access logs (service_user:caddy 2775); only if logging is on
+    <app>.jsonl            # caddy JSON access log (rolled by caddy)
+    caddy.sqlite           # imported by the host-wide lux-caddylog service
   .env                     # rendered, PORT* live here (0600)
   systemd.service          # rendered web unit; linked to /etc/systemd/system/<prefix>-<app>.service
   systemd.<name>.service   # rendered extra unit; linked to /etc/systemd/system/<prefix>-<app>-<name>.service
@@ -245,6 +253,34 @@ in `remote_after.sh` and fails the command by exiting non-zero.
 
 `<app>` is the first comma-separated value of `DOMAIN` from the rendered
 `.env` (falls back to `.yaml`'s `domain:`; wildcards stripped: `*.foo` -> `foo`).
+
+## Access logging (Caddy -> SQLite)
+
+Optional. The `app:init` `caddy.conf` emits a JSON access log to
+`<app_dir>/log/<app>.jsonl` (rolled by caddy: 1GiB, 48 files, 168h). A single
+host-wide importer service (`lux-caddylog`, Bun) tails every site's JSONL and
+batch-inserts into that site's `caddy.sqlite` - crash-safe (rows + offset
+committed in one transaction; `event_id = sha256(line)` dedups on replay),
+rotation-aware, and pruned to 30 days.
+
+```
+Caddy -> <app_dir>/log/<app>.jsonl --(lux-caddylog)--> <app_dir>/log/caddy.sqlite
+```
+
+Behind Cloudflare, the importer reads the real visitor IP (`CF-Connecting-IP`)
+and `country` (`CF-IPCountry`) from request headers - the connection's
+`remote_ip` is the Cloudflare edge. `raw_json` keeps the full entry; common
+fields (`ts, remote_ip, country, method, host, uri, status, duration, size,
+user_agent, referer`) are extracted into columns.
+
+```sh
+lux-deploy caddy:log:prepare   # one-time per host: Bun + importer + enable lux-caddylog
+lux-deploy up                  # caddy starts logging; importer picks the site up
+lux-deploy caddy:log:status    # importer state + row count / ts span for this app
+```
+
+Existing apps are untouched until they re-`app:init` (or add the `log {}` block
+to their `caddy.conf`); the importer only watches sites that produce a JSONL.
 
 ## Manifest: `lux-deploy.yaml`
 

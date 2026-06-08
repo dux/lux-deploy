@@ -93,6 +93,26 @@ module LuxDeploy
       target.namespace(:server)  { LuxDeploy::Hammer.define_server_on(self, tdir) }
       target.namespace(:on)      { LuxDeploy::Hammer.define_on_hooks_on(self, tdir) }
       target.namespace(:prepare) { LuxDeploy::Hammer.define_prepare_on(self, tdir) }
+      target.namespace(:caddy)   { LuxDeploy::Hammer.define_caddy_on(self, tdir) }
+    end
+
+    def define_caddy_on(target, tdir)
+      target.namespace(:log) { LuxDeploy::Hammer.define_caddy_log_on(self, tdir) }
+    end
+
+    def define_caddy_log_on(target, tdir)
+      target.task :prepare do
+        desc 'Install Bun + the host-wide Caddy access-log -> SQLite importer'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.caddy_log_prepare(opts) } }
+      end
+
+      target.task :status do
+        desc 'Show the importer service + this app SQLite stats'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.caddy_log_status(opts.merge(templates_dir: tdir)) } }
+      end
     end
 
     def define_on_hooks_on(target, tdir)
@@ -153,6 +173,13 @@ module LuxDeploy
         opt :server,  desc: 'Override hostname from config/deploy/.yaml'
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_mise(opts) } }
+      end
+
+      target.task :bun do
+        desc 'Install Bun for the service user'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_bun(opts) } }
       end
     end
 

@@ -50,6 +50,8 @@ module LuxDeploy
         mv new-release release
       SH
 
+      ensure_caddy_log_dir(ctx)
+
       step 'install systemd + caddy symlinks'
       install_system_symlinks(ctx)
 
@@ -149,6 +151,41 @@ module LuxDeploy
       step "prepare nginx on #{ssh.host}"
       Prepare.nginx(ssh)
       step 'done. nginx installed, sites-enabled wired, service running'
+    end
+
+    def prepare_bun(opts)
+      ssh = prepare_ssh(opts)
+      step "prepare bun on #{ssh.host}"
+      Prepare.bun(ssh)
+      step "done. bun installed for #{ssh.service_user}"
+    end
+
+    # -------- caddy:log:* --------------------------------------------------
+
+    # Host setup for access-log ingestion: bun + the bundled importer script +
+    # one host-wide systemd service scanning every app's log dir. Idempotent.
+    def caddy_log_prepare(opts)
+      config = Config.load
+      ssh    = prepare_ssh(opts)
+      step "prepare caddy log importer on #{ssh.host}"
+      Prepare.bun(ssh)
+      Prepare.install_importer(ssh, IMPORTER_LOCAL, IMPORTER_REMOTE)
+      Prepare.caddy_log_service(ssh, scan_root: config.remote_base,
+                                     importer: IMPORTER_REMOTE, retain: IMPORTER_RETAIN)
+      step "done. #{IMPORTER_UNIT} scanning #{config.remote_base}/*/log (retain #{IMPORTER_RETAIN}d)"
+    end
+
+    # Per-app inspection: host-wide importer unit status + this app's log dir
+    # listing + SQLite stats (row count, ts span, checkpoint).
+    def caddy_log_status(opts)
+      ctx = Context.build(opts, render: false)
+      dir = "#{ctx.app_dir}/log"
+      bun = "/home/#{ctx.config.service_user}/.bun/bin/bun"
+      step "caddy log status for #{ctx.app}"
+      ctx.ssh.stream("systemctl status #{IMPORTER_UNIT} --no-pager", allow_fail: true)
+      ctx.ssh.stream("ls -lh #{Shellwords.escape(dir)}/ 2>/dev/null || true", as: :service, allow_fail: true)
+      ctx.ssh.stream("#{bun} #{Shellwords.escape(IMPORTER_REMOTE)} stats --db #{Shellwords.escape("#{dir}/caddy.sqlite")}",
+                     as: :service, allow_fail: true)
     end
 
     def prepare_ssh(opts)
@@ -327,6 +364,23 @@ module LuxDeploy
       SH
     end
 
+    # Caddy (caddy user) writes the JSONL access log; the lux-caddylog importer
+    # (service user) reads it and writes caddy.sqlite in the same dir. Pre-create
+    # <app_dir>/log as service_user:caddy 2775 (setgid) so caddy writes via the
+    # group and the service user owns it - paired with `mode 0644` on caddy's
+    # file output. Runs as root for the cross-user chown. Only when the rendered
+    # caddy.config actually emits a .jsonl, so non-logging apps are untouched.
+    # Falls back to the service user's own group on hosts with no caddy.
+    def ensure_caddy_log_dir(ctx)
+      return unless ctx.rendered['caddy.config'].to_s.match?(/output file \S*\.jsonl/)
+      step 'ensure caddy log dir (<app_dir>/log)'
+      dir = "#{ctx.app_dir}/log"
+      ctx.ssh.run(<<~SH)
+        grp=caddy; getent group caddy >/dev/null 2>&1 || grp=#{ctx.config.service_user}
+        install -d -o #{ctx.config.service_user} -g "$grp" -m 2775 #{Shellwords.escape(dir)}
+      SH
+    end
+
     # Resolve every managed PORT* token to a concrete port. Tokens come from
     # needed_port_keys (PORT* keys in .env + {{PORT*}} placeholders in any
     # template). Each is reused from the remote .env when present, else a free
@@ -421,7 +475,11 @@ module LuxDeploy
     def render_artifacts(ctx)
       step 'render templates'
 
-      vars = ctx.base_vars.merge(ctx.ports).merge(DIR: ctx.app_dir)
+      vars = ctx.base_vars.merge(ctx.ports).merge(
+        DIR:      ctx.app_dir,
+        LOG_DIR:  "#{ctx.app_dir}/log",
+        LOG_NAME: ctx.app
+      )
       # RUBY/RUBY_DIR (and the ssh ruby probe) only when a template asks for
       # them - a Go/Python unit running a built binary never triggers it.
       if ctx.ruby_used?

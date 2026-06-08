@@ -5,7 +5,7 @@ Gem::Specification.new 'lux-deploy', version do |s|
   s.description = 'Caddy + systemd + atomic-release deploys over SSH. Lux is one flavor; bring your own adapter for Rails, static sites, anything else.'
   s.authors     = ['Dino Reic']
   s.email       = 'rejotl@gmail.com'
-  s.files       = Dir['./lib/**/*.rb'] + Dir['./templates/**/*'] + ['./.version', './README.md', './bin/lux-deploy', './Hammerfile']
+  s.files       = Dir['./lib/**/*.rb'] + Dir['./templates/**/*'] + Dir['./assets/**/*'] + ['./.version', './README.md', './bin/lux-deploy', './Hammerfile']
   s.bindir      = 'bin'
   s.executables = ['lux-deploy']
   s.homepage    = 'https://github.com/dux/lux-deploy'

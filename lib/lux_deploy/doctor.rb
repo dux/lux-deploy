@@ -15,7 +15,7 @@ module LuxDeploy
     # may reference these without declaring them in .env or .yaml.
     PROVIDED_VARS ||= %w[
       GIT_BRANCH GIT_BRANCH_UNDERSCORE APP APP_UNDERSCORE HASH TAG
-      PORT DIR RUBY RUBY_DIR
+      PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME
     ].freeze
 
     module_function
@@ -73,6 +73,13 @@ module LuxDeploy
     # the ruby/bundler host checks so a Go/Python app doesn't fail doctor.
     def ruby_runtime?(dir = './config/deploy')
       Dir.glob("#{dir}/*").any? { |f| File.file?(f) && File.read(f).include?('{{RUBY') }
+    end
+
+    # True when caddy.conf emits a JSON access log - gates the bun/importer
+    # host checks so apps without access logging don't fail doctor.
+    def caddy_log?(dir = './config/deploy')
+      f = "#{dir}/caddy.conf"
+      File.exist?(f) && File.read(f).include?('.jsonl')
     end
 
     def local_checks(_config)
@@ -220,6 +227,24 @@ module LuxDeploy
             "bundler on #{user} PATH",
             "sudo -iu #{user} bash -lc 'command -v bundle >/dev/null'",
             "sudo -iu #{user} bash -lc 'gem install bundler --no-document'"
+          ]
+        ] : []),
+        # Access-log ingestion: only when this app emits a JSON access log.
+        *(caddy_log? ? [
+          [
+            "bun installed for #{user}",
+            "sudo -iu #{user} bash -lc '[ -x ~/.bun/bin/bun ]'",
+            nil
+          ],
+          [
+            "caddy-log importer present (#{IMPORTER_REMOTE})",
+            "[ -f #{IMPORTER_REMOTE} ]",
+            nil
+          ],
+          [
+            "caddy-log importer service running (#{IMPORTER_UNIT})",
+            "systemctl is-active --quiet #{IMPORTER_UNIT}",
+            nil
           ]
         ] : []),
         [

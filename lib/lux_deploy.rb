@@ -19,6 +19,14 @@ module LuxDeploy
   CADDY_SITES ||= '/etc/caddy/sites'
   SYSTEMD_DIR ||= '/etc/systemd/system'
 
+  # Caddy access-log -> SQLite importer. One host-wide service (IMPORTER_UNIT)
+  # runs the bundled script (uploaded to IMPORTER_REMOTE) and scans every app's
+  # log dir. Installed by `caddy:log:prepare`.
+  IMPORTER_LOCAL    ||= ROOT.join('assets', 'caddy-log-importer.ts').to_s
+  IMPORTER_REMOTE   ||= '/usr/local/lib/lux-deploy/caddy-log-importer.ts'
+  IMPORTER_UNIT     ||= 'lux-caddylog'
+  IMPORTER_RETAIN   ||= 30
+
   class Error < StandardError
     def to_s
       "ERROR: #{super}"
