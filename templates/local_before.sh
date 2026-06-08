@@ -15,7 +15,8 @@
 #
 # Non-zero exit aborts the deploy before any code is rsynced. Optional -
 # delete the file if you don't want a local gate.
-set -euo pipefail
+#
+# lux-deploy runs this hook with `set -euo pipefail` already enabled.
 
 # Cache gems locally so the rsync ships vendor/cache/*.gem to the server.
 # Native gems (pg, nokogiri, etc.) cached on macOS won't match Debian, so

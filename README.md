@@ -22,12 +22,37 @@ gem 'lux-deploy'
 ## Quick start
 
 ```sh
-bundle exec lux-deploy app:init     # copy starter templates into ./config/deploy/
+bundle exec lux-deploy app:init      # copy starter templates into ./config/deploy/
 $EDITOR config/deploy/.yaml          # set server: and domain:
 $EDITOR config/deploy/systemd.service # set your ExecStart
-bundle exec lux-deploy doctor        # prep + check the host
+bundle exec lux-deploy prepare:caddy # install + wire the reverse proxy (one-time, per host)
+bundle exec lux-deploy doctor        # check the host
 bundle exec lux-deploy up            # ship it
 ```
+
+## Host preparation
+
+`prepare:*` bootstraps the reverse proxy on a fresh host - one command,
+run once per server (it is idempotent, so re-running is safe):
+
+```sh
+lux-deploy prepare:caddy   # install Caddy, create /etc/caddy/sites, wire the import, enable
+lux-deploy prepare:nginx   # install nginx, create sites-enabled, wire the include, enable
+lux-deploy prepare:mise    # install mise for the service user, activate it in the login shell
+```
+
+The proxy tasks target Debian/Ubuntu (apt) and run as root over SSH. This is
+the one gap `doctor` does not close on its own: `doctor` *checks* that the
+proxy and mise are installed and wired, but never installs them for you -
+`prepare:*` does. `prepare:mise` installs mise under the service user and
+wires `mise activate bash` into `~/.profile`, so the login shell every remote
+deploy step uses (`sudo -iu <user> bash -lc`) resolves `ruby`/`bundle`.
+
+The deploy flow itself is **Caddy-fronted**: `up` renders a `caddy.config`
+and links it into `/etc/caddy/sites/<app>.caddy`. `prepare:nginx` installs
+and wires nginx as host groundwork, but the deploy does not yet emit nginx
+site files - use it when you are setting up nginx for other purposes on the
+box, or as the basis for a custom proxy setup.
 
 ## Configuration: `config/deploy/.yaml`
 
@@ -119,10 +144,11 @@ Precedence: user `.yaml` > plugin `defaults` > engine defaults.
 | `lux-deploy up`        | deploy current branch |
 | `lux-deploy redeploy`  | destroy + deploy (fresh PORTs) |
 | `lux-deploy destroy`   | stop service, unlink caddy/systemd, remove `~/<remote_base>/<app>` |
-| `lux-deploy doctor`    | check & prepare host (deployer user, dirs, caddy, ruby, bundler) |
+| `lux-deploy doctor`    | check + auto-fix host (deployer user, dirs, caddy, ruby, bundler) |
 | `lux-deploy app:init`  | copy bundled templates into `./config/deploy/` |
 | `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
 | `lux-deploy prepare:nginx` | install + configure nginx on the host (sites-enabled, enable) |
+| `lux-deploy prepare:mise` | install mise for the service user + activate it in the login shell |
 | `lux-deploy on:local:before`  | run `config/deploy/local_before.sh` locally |
 | `lux-deploy on:remote:before` | run `config/deploy/remote_before.sh` on `new-release/` |
 | `lux-deploy on:remote:after`  | run `config/deploy/remote_after.sh` on `release/` |

@@ -147,6 +147,13 @@ module LuxDeploy
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_nginx(opts) } }
       end
+
+      target.task :mise do
+        desc 'Install mise for the service user + activate it in the login shell'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_mise(opts) } }
+      end
     end
 
     def define_server_on(target, tdir)

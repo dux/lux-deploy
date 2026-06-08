@@ -12,4 +12,5 @@
 #
 # Non-zero exit warns but does NOT roll back (the deploy is already live).
 # Optional - delete the file if you don't want a local post-hook.
-set -euo pipefail
+#
+# lux-deploy runs this hook with `set -euo pipefail` already enabled.

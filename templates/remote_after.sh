@@ -15,4 +15,5 @@
 # Non-zero exit fails the deploy command but does NOT roll back (the new
 # release is already live; rolling back here would require a second swap).
 # Optional - delete the file if you don't want a server hook.
-set -euo pipefail
+#
+# lux-deploy runs this hook with `set -euo pipefail` already enabled.

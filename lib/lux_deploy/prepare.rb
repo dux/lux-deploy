@@ -35,6 +35,34 @@ module LuxDeploy
       SH
     end
 
+    # Install mise for the service user and activate it in the login shell.
+    # lux-deploy runs every remote step via `sudo -iu <user> bash -lc`, so the
+    # activation must live where a non-interactive login shell sources it.
+    # Debian's default .bashrc returns early for non-interactive shells, so we
+    # wire .profile (no interactive guard, sourced by `bash -lc`) instead.
+    def mise(ssh)
+      user = ssh.service_user
+      ssh.stream(<<~SH)
+        set -e
+        if sudo -iu #{user} bash -lc 'command -v mise >/dev/null'; then
+          echo "mise already installed: $(sudo -iu #{user} bash -lc 'mise version' | head -n1)"
+        else
+          echo "installing mise for #{user}"
+          sudo -iu #{user} bash -lc 'curl -fsSL https://mise.run | sh'
+        fi
+
+        rc=/home/#{user}/.profile
+        if ! grep -q 'mise activate bash' "$rc" 2>/dev/null; then
+          echo "wiring mise activate into $rc"
+          printf '\\neval "$(~/.local/bin/mise activate bash)"\\n' | sudo -u #{user} tee -a "$rc" >/dev/null
+        fi
+
+        # Prove it resolves in a fresh login shell - the same shape every
+        # remote deploy step uses.
+        sudo -iu #{user} bash -lc 'mise --version'
+      SH
+    end
+
     def nginx(ssh)
       ssh.stream(<<~SH)
         set -e

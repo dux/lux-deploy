@@ -12,7 +12,8 @@
 #
 # Non-zero exit aborts the deploy: new-release/ is kept for inspection,
 # release/ keeps serving.
-set -euo pipefail
+#
+# lux-deploy runs this hook with `set -euo pipefail` already enabled.
 
 # --- Ruby / Bundler defaults --------------------------------------------
 # mise prompts y/n the first time it sees a new toml; trust silences it.

@@ -132,6 +132,13 @@ module LuxDeploy
       step "done. caddy installed, #{CADDY_SITES} wired, service running"
     end
 
+    def prepare_mise(opts)
+      ssh = prepare_ssh(opts)
+      step "prepare mise on #{ssh.host}"
+      Prepare.mise(ssh)
+      step "done. mise installed for #{ssh.service_user}, activated in login shell"
+    end
+
     def prepare_nginx(opts)
       ssh = prepare_ssh(opts)
       step "prepare nginx on #{ssh.host}"
@@ -444,6 +451,14 @@ module LuxDeploy
       end
     end
 
+    # Strict mode is enforced by the engine, not by each hook script, so the
+    # templates don't have to repeat `set -euo pipefail`. Sourcing (not `bash
+    # <file>`) is what makes the flags apply inside the hook - a child `bash
+    # <file>` would not inherit them.
+    def run_local_hook(path)
+      system('bash', '-c', "set -euo pipefail\nsource #{Shellwords.escape(path)}")
+    end
+
     LOCAL_BEFORE_HOOK  ||= 'config/deploy/local_before.sh'
     REMOTE_BEFORE_HOOK ||= 'config/deploy/remote_before.sh'
     REMOTE_AFTER_HOOK  ||= 'config/deploy/remote_after.sh'
@@ -479,7 +494,7 @@ module LuxDeploy
         $stderr.puts "  [dry] bash #{LOCAL_BEFORE_HOOK}"
         return
       end
-      system('bash', LOCAL_BEFORE_HOOK) or
+      run_local_hook(LOCAL_BEFORE_HOOK) or
         raise Error.new("#{LOCAL_BEFORE_HOOK} failed; deploy aborted (no remote state changed)")
     end
 
@@ -503,7 +518,8 @@ module LuxDeploy
         set -e
         cd #{Shellwords.escape(ctx.app_dir)}/new-release
         #{env_source_sh('.env')}
-        bash #{Shellwords.escape(REMOTE_BEFORE_HOOK)}
+        set -uo pipefail
+        source #{Shellwords.escape(REMOTE_BEFORE_HOOK)}
       SH
       return if ok
       raise Error.new(
@@ -529,7 +545,8 @@ module LuxDeploy
         set -e
         cd #{Shellwords.escape(ctx.app_dir)}/release
         #{env_source_sh('.env')}
-        bash #{Shellwords.escape(REMOTE_AFTER_HOOK)}
+        set -uo pipefail
+        source #{Shellwords.escape(REMOTE_AFTER_HOOK)}
       SH
       return if ok
       raise Error.new(
@@ -552,7 +569,7 @@ module LuxDeploy
         $stderr.puts "  [dry] bash #{LOCAL_AFTER_HOOK}"
         return
       end
-      return if system('bash', LOCAL_AFTER_HOOK)
+      return if run_local_hook(LOCAL_AFTER_HOOK)
       msg = "#{LOCAL_AFTER_HOOK} failed"
       strict ? raise(Error.new(msg)) : warn("#{msg} but deploy is already live; continuing")
     end
