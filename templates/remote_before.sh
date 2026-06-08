@@ -13,12 +13,10 @@
 # Non-zero exit aborts the deploy: new-release/ is kept for inspection,
 # release/ keeps serving.
 #
-# lux-deploy runs this hook with `set -euo pipefail` already enabled.
+# lux-deploy runs this hook with `set -euo pipefail` already enabled, has
+# installed the pinned toolchain (mise install), and trusts mise.toml.
 
 # --- Ruby / Bundler defaults --------------------------------------------
-# mise prompts y/n the first time it sees a new toml; trust silences it.
-[ -f mise.toml ] && mise trust mise.toml >/dev/null 2>&1 || true
-
 # Pin bundler to the version Gemfile.lock was generated with so bundler
 # doesn't self-restart on every deploy. --conservative skips the install
 # when the version is already present.

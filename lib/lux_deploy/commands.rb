@@ -14,7 +14,6 @@ module LuxDeploy
       ensure_remote_dirs(ctx)
       wipe_stale_new_release(ctx)
       ctx.ports ||= allocate_ports(ctx)
-      render_artifacts(ctx)
 
       step 'rsync code'
       # Source is config `src:` (default ./). An app may build an artifact in
@@ -31,6 +30,12 @@ module LuxDeploy
         ln -sfn ../shared/log log && \
         ln -sfn ../.env       .env
       SH
+
+      # Materialize the pinned toolchain now that mise.toml is on the server,
+      # BEFORE render_artifacts -> detect_ruby_path globs for an installed
+      # ruby, so the install has to come first.
+      ensure_toolchain_installed(ctx)
+      render_artifacts(ctx)
 
       step 'write rendered .env / systemd.service / caddy.config'
       upload_artifacts(ctx)
@@ -389,6 +394,25 @@ module LuxDeploy
         .lines.map { |l| l.strip.to_i }.to_set
     end
 
+    # Install whatever the app pins in mise.toml (ruby, node, ...) before the
+    # render probes for ruby. Runs in new-release/ so mise reads the app's own
+    # pin - no version parsing here. Gated on the file existing, so non-mise
+    # apps (system ruby, asdf, Go/Python) are untouched. trust silences mise's
+    # first-run y/n on a config path it hasn't seen; both are idempotent.
+    def ensure_toolchain_installed(ctx)
+      step 'mise install (pinned toolchain)'
+      ctx.ssh.stream(<<~SH, as: :service)
+        set -e
+        cd #{Shellwords.escape(ctx.app_dir)}/new-release
+        if [ -f mise.toml ]; then
+          mise trust mise.toml >/dev/null 2>&1 || true
+          mise install
+        else
+          echo "no mise.toml, skipping mise install"
+        fi
+      SH
+    end
+
     # One-pass render. Every template (.env, caddy.conf, and each
     # *.service unit) is rendered with the same var set: git-derived + yaml +
     # engine-dynamic (PORT*/DIR, plus RUBY/RUBY_DIR when referenced).
@@ -517,6 +541,7 @@ module LuxDeploy
       ok = ctx.ssh.stream(<<~SH, as: :service, allow_fail: true)
         set -e
         cd #{Shellwords.escape(ctx.app_dir)}/new-release
+        [ -f mise.toml ] && mise trust mise.toml >/dev/null 2>&1 || true
         #{env_source_sh('.env')}
         set -uo pipefail
         source #{Shellwords.escape(REMOTE_BEFORE_HOOK)}
@@ -544,6 +569,7 @@ module LuxDeploy
       ok = ctx.ssh.stream(<<~SH, as: :service, allow_fail: true)
         set -e
         cd #{Shellwords.escape(ctx.app_dir)}/release
+        [ -f mise.toml ] && mise trust mise.toml >/dev/null 2>&1 || true
         #{env_source_sh('.env')}
         set -uo pipefail
         source #{Shellwords.escape(REMOTE_AFTER_HOOK)}
