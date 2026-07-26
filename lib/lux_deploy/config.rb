@@ -16,7 +16,8 @@ module LuxDeploy
       'on_fail'        => 'keep',
       'health'         => true,
       'boot_timeout'   => 30,
-      'health_path'    => nil
+      'health_path'    => nil,
+      'branch_domain'  => '{{GIT_BRANCH_SLUG}}.{{APP_DOMAIN}}'
     }.freeze
 
     # What `up` does when a post-swap step fails. `keep` leaves the new release
@@ -29,8 +30,8 @@ module LuxDeploy
     # `template_vars` map so they never become `{{SERVICE_PREFIX}}` etc.
     # `server` is also behavioral (target host) but historically exposed
     # as `{{SERVER}}` in caddy.conf, so it stays in template_vars.
-    BEHAVIORAL_KEYS ||= %w[service_user remote_base service_prefix
-                           on_fail health boot_timeout health_path src].freeze
+    BEHAVIORAL_KEYS ||= %w[service_user remote_base service_prefix on_fail
+                           health boot_timeout health_path branch_domain src].freeze
 
     attr_reader :raw
 
@@ -82,6 +83,15 @@ module LuxDeploy
     def boot_timeout
       v = raw['boot_timeout'].to_i
       v.positive? ? v : 30
+    end
+
+    # Hostname pattern for a non-main branch. Rendered with GIT_BRANCH,
+    # GIT_BRANCH_UNDERSCORE, GIT_BRANCH_SLUG and APP_DOMAIN - so
+    # '{{GIT_BRANCH_SLUG}}.staging.{{APP_DOMAIN}}' groups every branch under a
+    # single wildcard cert, if you would rather have that.
+    def branch_domain
+      v = raw['branch_domain'].to_s.strip
+      v.empty? ? ENGINE_DEFAULTS['branch_domain'] : v
     end
 
     # Optional HTTP probe on top of the port wait, e.g. `health_path: /up`.

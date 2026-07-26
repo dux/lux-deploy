@@ -15,7 +15,8 @@ module LuxDeploy
     # Placeholders the engine always provides at deploy time; templates
     # may reference these without declaring them in .env or .yaml.
     PROVIDED_VARS ||= %w[
-      GIT_BRANCH GIT_BRANCH_UNDERSCORE APP APP_UNDERSCORE HASH TAG
+      GIT_BRANCH GIT_BRANCH_UNDERSCORE GIT_BRANCH_SLUG
+      APP APP_UNDERSCORE APP_DOMAIN DOMAIN HASH TAG
       PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME SERVICE_USER SERVICE_HOME
     ].freeze
 
@@ -161,19 +162,23 @@ module LuxDeploy
         yaml_data = {}
       end
 
-      report.call(File.exist?("#{dir}/.env"),            "#{dir}/.env present")
+      # One env template per branch: .env.main serves master/main, .env.default
+      # every other branch, .env.<branch> wins for one specific branch.
+      env_files = Dir.children(dir).select { |f| f.start_with?('.env') && f != '.env.local' }.sort
+      report.call(env_files.any?, "#{dir}/.env.* template present",
+                  'expected at least .env.main or .env.default; run: lux-deploy app:init')
       report.call(File.exist?("#{dir}/caddy.conf"),      "#{dir}/caddy.conf present")
       report.call(File.exist?("#{dir}/systemd.service"), "#{dir}/systemd.service present")
 
-      # The .env template is rendered fresh on every deploy, so anything real
-      # in it is a secret living in the repo. Server-side values belong in
+      # These are rendered fresh on every deploy, so anything real in them is a
+      # secret living in the repo. Server-side values belong in
       # <app_dir>/.env.local (see `lux-deploy env:set`).
-      if File.exist?("#{dir}/.env")
-        nag.call(!File.read("#{dir}/.env").include?('replace-me'),
-                 '.env has no leftover replace-me values',
+      env_files.each do |name|
+        path = "#{dir}/#{name}"
+        nag.call(!File.read(path).include?('replace-me'), "#{name} has no leftover replace-me values",
                  'set it on the server instead: lux-deploy env:set SECRET=$(openssl rand -hex 32)')
-        nag.call(gitignored?("#{dir}/.env"), "#{dir}/.env is gitignored",
-                 'it can hold secrets; add config/deploy/.env to .gitignore')
+        nag.call(gitignored?(path), "#{path} is gitignored",
+                 "it can hold secrets; add #{path} to .gitignore")
       end
 
       # A local .env.local does nothing - the overlay lives on the server, at
@@ -201,8 +206,8 @@ module LuxDeploy
       # Every *.service file is a service; only systemd.service is required.
       # PORT-prefixed placeholders are engine-provided (auto-allocated).
       service_files       = Dir.children(dir).select { |f| f.end_with?('.service') && !f.start_with?('!') }.sort
-      optional            = %w[.env.staging] + (service_files - %w[systemd.service])
-      placeholder_targets = %w[.env .env.staging caddy.conf] + service_files
+      optional            = env_files + (service_files - %w[systemd.service])
+      placeholder_targets = env_files + %w[caddy.conf] + service_files
       provided            = PROVIDED_VARS + yaml_keys
       placeholder_targets.uniq.each do |name|
         path = "#{dir}/#{name}"

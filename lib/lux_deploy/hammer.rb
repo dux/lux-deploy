@@ -116,6 +116,12 @@ module LuxDeploy
     end
 
     def define_caddy_on(target, tdir)
+      target.task :doctor do
+        desc 'Check the caddy install and table every site file on the host'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.caddy_doctor(opts) } }
+      end
+
       target.namespace(:log) { LuxDeploy::Hammer.define_caddy_log_on(self, tdir) }
     end
 

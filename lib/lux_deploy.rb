@@ -9,7 +9,9 @@ module LuxDeploy
   ROOT ||= Pathname.new(File.expand_path('..', __dir__))
   VERSION ||= File.read(ROOT.join('.version')).strip
 
-  # Branches that select `.env` instead of `.env.staging`.
+  # Branches that serve `domain:` verbatim and select `.env.main`. Every other
+  # branch is its own deploy under <remote_base>/<domain>/<branch>/ and uses
+  # `.env.default` (or `.env.<branch>`).
   MAIN_BRANCHES ||= %w[master main]
 
   # Server-side conventions. Not config-tunable because doctor and the

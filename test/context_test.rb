@@ -8,8 +8,8 @@ class ContextTest < Minitest::Test
   YAML_MIN = "server: srv.example.com\ndomain: example.com\n".freeze
 
   def in_app(files = {}, branch: 'main', &block)
-    in_project({ '.yaml' => YAML_MIN, '.env' => '', 'caddy.conf' => '',
-                 'systemd.service' => '' }.merge(files)) do
+    in_project({ '.yaml' => YAML_MIN, '.env.main' => '', '.env.default' => '',
+                 'caddy.conf' => '', 'systemd.service' => '' }.merge(files)) do
       git_repo(branch)
       block.call(LuxDeploy::Context.build({}))
     end
@@ -28,7 +28,7 @@ class ContextTest < Minitest::Test
   def test_web_service_plus_one_extra_unit
     in_app({ 'job.service' => '' }) do |ctx|
       assert_equal %w[web job], ctx.services.map(&:name)
-      assert_equal %w[web-example.com web-example.com-job], ctx.services.map(&:unit)
+      assert_equal %w[web-example.com-main web-example.com-main-job], ctx.services.map(&:unit)
       assert_equal %w[systemd.service systemd.job.service], ctx.services.map(&:artifact)
     end
   end
@@ -39,19 +39,76 @@ class ContextTest < Minitest::Test
     end
   end
 
-  def test_app_slug_strips_a_wildcard_and_takes_the_first_domain
-    in_project({ '.yaml' => "server: s\ndomain: '*.example.com, example.org'\n" }) do
+  # ---- branch is the deploy unit -----------------------------------------
+
+  def test_main_serves_the_yaml_domain_verbatim
+    in_project({ '.yaml' => "server: s\ndomain: example.com, www.example.com\n",
+                 '.env.main' => '' }) do
       git_repo('main')
       ctx = LuxDeploy::Context.build({})
 
-      assert_equal 'example.com', ctx.app
-      assert_equal '/home/deployer/apps/example.com', ctx.app_dir
+      assert_equal 'example.com',                        ctx.app_domain
+      assert_equal 'example.com, www.example.com',       ctx.domain_list
+      assert_equal %w[example.com www.example.com],      ctx.domains
+      assert_equal 'example.com-main',                   ctx.app
+      assert_equal '/home/deployer/apps/example.com/main', ctx.app_dir
+      assert ctx.main_branch?
     end
   end
 
-  def test_env_template_falls_back_to_main_or_staging
-    in_app({}, branch: 'main')    { |ctx| assert_equal '.env',         ctx.env_template_name }
-    in_app({}, branch: 'topic')   { |ctx| assert_equal '.env.staging', ctx.env_template_name }
+  def test_a_branch_gets_its_own_host_and_directory
+    in_app({}, branch: 'topic') do |ctx|
+      assert_equal 'example.com',                           ctx.app_domain
+      assert_equal 'topic.example.com',                     ctx.domain_list
+      assert_equal 'example.com-topic',                     ctx.app
+      assert_equal '/home/deployer/apps/example.com/topic', ctx.app_dir
+      assert_equal '/home/deployer/apps/example.com',       ctx.app_root
+      refute ctx.main_branch?
+    end
+  end
+
+  # Two branches of one app must never collide anywhere on the box.
+  def test_two_branches_share_nothing
+    fields = ->(c) { [c.app_dir, c.app, c.domain_list, c.domain_tag, c.services.first.unit] }
+    main  = in_app({}, branch: 'main',  &fields)
+    topic = in_app({}, branch: 'topic', &fields)
+
+    assert_empty(main & topic, "these values collide across branches: #{(main & topic).inspect}")
+  end
+
+  def test_branch_names_are_dns_slugged
+    in_app({}, branch: 'Feature/Login-42') do |ctx|
+      assert_equal 'feature-login-42', ctx.branch_slug
+      assert_equal 'feature-login-42.example.com', ctx.domain_list
+      assert_equal '/home/deployer/apps/example.com/feature-login-42', ctx.app_dir
+    end
+  end
+
+  def test_branch_domain_pattern_is_configurable
+    yaml = "server: s\ndomain: example.com\nbranch_domain: '{{GIT_BRANCH_SLUG}}.staging.{{APP_DOMAIN}}'\n"
+    in_project({ '.yaml' => yaml, '.env.default' => '' }) do
+      git_repo('topic')
+      ctx = LuxDeploy::Context.build({})
+
+      assert_equal 'topic.staging.example.com', ctx.domain_list
+    end
+  end
+
+  def test_app_domain_strips_a_wildcard_and_takes_the_first_entry
+    in_project({ '.yaml' => "server: s\ndomain: '*.example.com, example.org'\n", '.env.main' => '' }) do
+      git_repo('main')
+      ctx = LuxDeploy::Context.build({})
+
+      assert_equal 'example.com', ctx.app_domain
+      assert_equal '/home/deployer/apps/example.com/main', ctx.app_dir
+    end
+  end
+
+  # ---- env template chain -------------------------------------------------
+
+  def test_env_template_picks_main_or_default
+    in_app({}, branch: 'main')  { |ctx| assert_equal '.env.main',    ctx.env_template_name }
+    in_app({}, branch: 'topic') { |ctx| assert_equal '.env.default', ctx.env_template_name }
   end
 
   def test_a_per_branch_env_template_wins
@@ -60,9 +117,9 @@ class ContextTest < Minitest::Test
     end
   end
 
-  def test_a_slashed_branch_resolves_to_the_underscored_template
-    in_app({ '.env.feature_x' => '' }, branch: 'feature/x') do |ctx|
-      assert_equal '.env.feature_x', ctx.env_template_name
+  def test_a_slashed_branch_resolves_to_the_slugged_template
+    in_app({ '.env.feature-x' => '' }, branch: 'feature/x') do |ctx|
+      assert_equal '.env.feature-x', ctx.env_template_name
     end
   end
 
@@ -70,8 +127,20 @@ class ContextTest < Minitest::Test
   # must not turn a local file of that name into the env template.
   def test_env_local_is_never_picked_as_a_branch_template
     in_app({ '.env.local' => '' }, branch: 'local') do |ctx|
-      assert_equal '.env.staging', ctx.env_template_name
+      assert_equal '.env.default', ctx.env_template_name
     end
+  end
+
+  def test_no_env_template_names_what_it_looked_for
+    err = assert_raises(LuxDeploy::Error) do
+      in_project({ '.yaml' => YAML_MIN }) do
+        git_repo('topic')
+        LuxDeploy::Context.build({})
+      end
+    end
+
+    assert_includes err.message, '.env.default'
+    assert_includes err.message, '.env.topic'
   end
 
   def test_a_bad_on_fail_fails_before_any_remote_work
@@ -91,7 +160,7 @@ class ContextTest < Minitest::Test
   end
 
   def test_needed_port_keys_unions_env_declarations_and_placeholders
-    in_app({ '.env'            => "PORT=\nPORT_JOB=\nDB_URL=x\n",
+    in_app({ '.env.main'       => "PORT=\nPORT_JOB=\nDB_URL=x\n",
              'caddy.conf'      => 'reverse_proxy localhost:{{PORT}}',
              'systemd.service' => 'ExecStart=app -p {{PORT_GRPC}}' }) do |ctx|
       assert_equal %i[PORT PORT_JOB PORT_GRPC], LuxDeploy::Commands.needed_port_keys(ctx)
@@ -113,20 +182,20 @@ class ContextTest < Minitest::Test
       man = LuxDeploy::RemoteState.parse(LuxDeploy::Manifest.render(ctx))
 
       refute_nil man
-      assert_equal 'example.com', man['app']
+      assert_equal 'example.com-main', man['app']
       assert_equal 'main',        man.dig('git', 'branch')
       assert_kind_of String,      man['deployed_at']
       assert_equal '<redacted>',  man.dig('env', 'SECRET')
       assert_equal 'example.com', man.dig('env', 'DOMAIN')
 
       units = LuxDeploy::RemoteState.manifest_services(man)
-      assert_equal %w[web-example.com web-example.com-job], units.map(&:unit)
+      assert_equal %w[web-example.com-main web-example.com-main-job], units.map(&:unit)
       assert_equal %w[systemd.service systemd.job.service], units.map(&:artifact)
     end
   end
 
   def test_a_web_app_gets_a_port_from_caddy_alone
-    in_app({ '.env' => "DB_URL=x\n", 'caddy.conf' => 'reverse_proxy localhost:{{PORT}}' }) do |ctx|
+    in_app({ '.env.main' => "DB_URL=x\n", 'caddy.conf' => 'reverse_proxy localhost:{{PORT}}' }) do |ctx|
       assert_equal [:PORT], LuxDeploy::Commands.needed_port_keys(ctx)
     end
   end

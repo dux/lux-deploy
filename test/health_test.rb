@@ -37,7 +37,7 @@ class HealthGateTest < Minitest::Test
   include ProjectFixture
 
   def in_app(yaml, ports: { PORT: 3010 })
-    in_project({ '.yaml' => yaml, '.env' => '', 'caddy.conf' => '', 'systemd.service' => '' }) do
+    in_project({ '.yaml' => yaml, '.env.main' => '', '.env.default' => '', 'caddy.conf' => '', 'systemd.service' => '' }) do
       system('git', 'init', '--quiet', '--initial-branch', 'main', out: File::NULL, err: File::NULL)
       system({ 'GIT_AUTHOR_NAME' => 't', 'GIT_AUTHOR_EMAIL' => 't@t',
                'GIT_COMMITTER_NAME' => 't', 'GIT_COMMITTER_EMAIL' => 't@t' },

@@ -37,7 +37,7 @@ module LuxDeploy
       # .env/.yaml split). env_snapshot is a redacted snapshot of the
       # rendered .env contents - informational only, never used for
       # template substitution.
-      domains      = ctx.config.domain.to_s.split(',').map(&:strip).reject(&:empty?)
+      domains      = ctx.domains
       env_snapshot = Template.parse_env(ctx.rendered['.env'])
 
       {

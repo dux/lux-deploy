@@ -38,13 +38,21 @@ module LuxDeploy
       end
     end
 
+    # DNS-safe form of a branch name - it ends up in a hostname, a systemd
+    # unit name and a directory name, so anything outside [a-z0-9-] collapses
+    # to a single dash. feature/Login-42 -> feature-login-42
+    def slug(str)
+      str.to_s.downcase.gsub(/[^a-z0-9]+/, '-').gsub(/\A-+|-+\z/, '')
+    end
+
     # Git-derived placeholders, computed locally before any rendering.
     def git_vars
       branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`.strip
       raise Error.new('not in a git repo (no current branch)') if branch.empty?
       {
         GIT_BRANCH:            branch,
-        GIT_BRANCH_UNDERSCORE: branch.gsub(/[^A-Za-z0-9]+/, '_')
+        GIT_BRANCH_UNDERSCORE: branch.gsub(/[^A-Za-z0-9]+/, '_'),
+        GIT_BRANCH_SLUG:       slug(branch)
       }
     end
   end

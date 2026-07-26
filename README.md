@@ -8,6 +8,13 @@ The primary configuration lives in `config/deploy/.yaml`, with an optional non-s
 No adapter classes or plugins need to be registered.
 Host defaults are baked into the gem, and app-specific settings go in the deploy configuration.
 
+**A git branch is a deploy.** `main` serves your `domain:`; every other branch gets its own directory, its own systemd units, its own ports and its own hostname, under the same app. Nothing a branch does can touch production.
+
+```
+/home/deployer/apps/example.com/main/     example.com, www.example.com
+/home/deployer/apps/example.com/topic/    topic.example.com
+```
+
 A file is the contract.
 Drop `job.service` in `config/deploy/` and it deploys as a second unit.
 Drop `remote_before.sh` and it becomes your build step.
@@ -104,14 +111,38 @@ Optional (defaults shown):
 
 ```yaml
 service_user:       deployer                # unix user that owns the app dir
-remote_base:        /home/deployer/apps     # ~/<remote_base>/<app>/
+remote_base:        /home/deployer/apps     # <remote_base>/<domain>/<branch>/
 service_prefix:     web                     # systemd units: <prefix>-<app>[-<svc>]
 src:                ./                      # local directory copied by rsync
 on_fail:            keep                    # keep | rollback, when a post-swap step fails
 health:             true                    # false disables the port-contract wait
 boot_timeout:       30                      # seconds to wait for the app to bind PORT
 health_path:                                # e.g. /up - adds an HTTP probe on top
+branch_domain:      '{{GIT_BRANCH_SLUG}}.{{APP_DOMAIN}}'   # hostname for a non-main branch
 ```
+
+### Branches
+
+Every deploy is a git branch. `master`/`main` is the production one; everything else is a separate deploy of the same app.
+
+| | `main` | branch `topic` |
+| --- | --- | --- |
+| serves (`{{DOMAIN}}`) | `example.com, www.example.com` | `topic.example.com` |
+| directory | `<remote_base>/example.com/main/` | `<remote_base>/example.com/topic/` |
+| units | `web-example.com-main` | `web-example.com-topic` |
+| caddy site | `example.com-main.caddy` | `example.com-topic.caddy` |
+| env template | `.env.main` | `.env.default` |
+| ports, `.env`, `.env.local`, lock, rollback | its own | its own |
+
+Branch names are DNS-slugged (`feature/Login-42` → `feature-login-42`), so they are safe in a hostname, a unit name and a directory name.
+
+`branch_domain:` sets the hostname pattern - it renders with `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`, `{{GIT_BRANCH_SLUG}}` and `{{APP_DOMAIN}}` (the first entry of `domain:`).
+Set it to `'{{GIT_BRANCH_SLUG}}.staging.{{APP_DOMAIN}}'` if you would rather cover every branch with one `*.staging.example.com` wildcard cert than let Caddy issue a certificate per branch host.
+
+`caddy.conf` and the unit templates need no branch awareness of their own: `{{DOMAIN}}` is already the right host for whichever branch is deploying.
+`{{HASH}}` and `{{TAG}}` derive from it too, so the caddy snippet name differs per branch rather than colliding.
+
+Tear one down with `lux-deploy destroy` from that branch; the parent `<domain>/` directory is removed once its last branch is gone.
 
 For a locally built deploy artifact, put its path in `config/deploy/src`.
 This non-secret file takes precedence over `.yaml` `src` and can be committed with the deploy configuration.
@@ -237,7 +268,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | `lux-deploy rollback`  | restore the previous release |
 | `lux-deploy status`    | what is live: commit, units, ports, rollback availability |
 | `lux-deploy redeploy`  | destroy + deploy (fresh PORTs) |
-| `lux-deploy destroy`   | stop service, unlink caddy/systemd, remove `~/<remote_base>/<app>` |
+| `lux-deploy destroy`   | stop this branch's services, unlink caddy/systemd, remove its dir |
 | `lux-deploy doctor`    | check + auto-fix host (deployer user, dirs, caddy, ruby, bundler) |
 | `lux-deploy app:init`  | copy bundled templates into `./config/deploy/` |
 | `lux-deploy env:list`  | effective server env, secrets redacted |
@@ -249,6 +280,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
 | `lux-deploy prepare:mise` | install mise for the service user + activate it in the login shell |
 | `lux-deploy prepare:bun` | install Bun for the service user |
+| `lux-deploy caddy:doctor` | check the caddy install + table every site file on the host |
 | `lux-deploy caddy:log:prepare` | install Bun + the host-wide access-log -> SQLite importer |
 | `lux-deploy caddy:log:status` | importer service status + this app's SQLite stats |
 | `lux-deploy on:local:before`  | run `config/deploy/local_before.sh` locally |
@@ -279,9 +311,9 @@ config/deploy/
   src                    # optional local rsync source; overrides .yaml src
   init.rb                # optional ruby loaded before any task
   health.sh              # optional: replaces the built-in port-contract wait
-  .env                   # production env (used on master/main)
-  .env.staging           # staging env (used on any other branch)
-  .env.<branch>          # optional per-branch env; wins when present
+  .env.main              # env for master/main
+  .env.default           # env for every other branch
+  .env.<branch>          # optional, wins for that one branch
   caddy.conf             # caddy site file
   systemd.service        # the web service (caddy-fronted)
   <name>.service         # optional: any extra service (job runner, grpc, ...)
@@ -301,7 +333,7 @@ The convention is global: any `!`-prefixed file in the repo (e.g. `!scratch.rb`)
 A `!`-disabled service is *not* torn down automatically - stop its unit on the box once (`systemctl disable --now <service_prefix>-<app>-<name>`).
 
 **Ports are magic**: any token matching `PORT*` is auto-allocated, persisted into the remote `.env` (0600), and reused on every later deploy.
-The set is the union of `PORT*` keys in `.env`/`.env.staging` and `{{PORT*}}` placeholders in any template.
+The set is the union of `PORT*` keys in the branch's env template and `{{PORT*}}` placeholders in any template.
 So a worker that needs its own port just references `{{PORT_JOB}}` in its unit (and/or declares `PORT_JOB=` in `.env`); the web service keeps its single `{{PORT}}`.
 The host is only probed when something new must be allocated - reuse never touches the network.
 When it does probe, it excludes both the ports currently listening (`ss -tln`) and every `PORT*` claimed in any app's `.env` on the host, so an app that happens to be stopped does not lose its port to the next deploy.
@@ -320,28 +352,40 @@ Build your app however you like in `remote_before.sh` (`go build`, `pip install`
 
 ## Server layout
 
+`<app>` below is `<domain>-<branch>` - the flat name used for units, the caddy file and the access log. The directory itself nests one level deeper, so every branch of an app sits under one parent.
+
 ```
-<remote_base>/<app>/
-  release/                 # current code + bundle
-    tmp -> ../shared/tmp
-    log -> ../shared/log
-    .env -> ../.env
-    .lux-deploy/           # the rendered artifacts this release shipped with
-  old-release/             # previous release, kept one cycle (what `rollback` restores)
-  shared/
-    tmp/                   # survives release swap
-    log/                   # survives release swap
-  log/                     # access logs (service_user:caddy 2775); only if logging is on
-    <app>.jsonl            # caddy JSON access log (rolled by caddy)
-    caddy.sqlite           # imported by the host-wide lux-caddylog service
-  .env                     # rendered, PORT* live here (0600)
-  .env.local               # server-only overlay, merged over .env (0600)
-  .deploy.lock             # present only while a deploy is running
-  systemd.service          # rendered web unit; linked to /etc/systemd/system/<prefix>-<app>.service
-  systemd.<name>.service   # rendered extra unit; linked to /etc/systemd/system/<prefix>-<app>-<name>.service
-  caddy.config             # rendered; linked into /etc/caddy/sites/<app>.caddy
-  lux-deploy.yaml          # post-deploy manifest, mode 0644 (see below)
+<remote_base>/<domain>/           # e.g. apps/example.com/ - holds every branch
+  <branch>/                       # e.g. main/, topic/ - one complete deploy
+    release/                 # current code + bundle
+      tmp -> ../shared/tmp
+      log -> ../shared/log
+      .env -> ../.env
+      .lux-deploy/           # the rendered artifacts this release shipped with
+    old-release/             # previous release, kept one cycle (what `rollback` restores)
+    shared/
+      tmp/                   # survives release swap
+      log/                   # survives release swap
+    log/                     # access logs (service_user:caddy 2775); only if logging is on
+      <app>.jsonl            # caddy JSON access log (rolled by caddy)
+      caddy.sqlite           # imported by the host-wide lux-caddylog service
+    .env                     # rendered, PORT* live here (0600)
+    .env.local               # server-only overlay, merged over .env (0600)
+    .deploy.lock             # present only while a deploy is running
+    systemd.service          # rendered web unit; linked to /etc/systemd/system/<prefix>-<app>.service
+    systemd.<name>.service   # rendered extra unit; linked to /etc/systemd/system/<prefix>-<app>-<name>.service
+    caddy.config             # rendered; linked into /etc/caddy/sites/<app>.caddy
+    lux-deploy.yaml          # post-deploy manifest, mode 0644 (see below)
 ```
+
+Everything is a symlink into that tree, so the install is inspectable with `ls -l`:
+
+```
+/etc/caddy/sites/example.com-main.caddy   -> <remote_base>/example.com/main/caddy.config
+/etc/systemd/system/web-example.com-main.service -> <remote_base>/example.com/main/systemd.service
+```
+
+`lux-deploy caddy:doctor` walks exactly that: whether caddy is installed, running and importing `/etc/caddy/sites/*.caddy`, then a table of every site file with the domains it declares, the upstream it proxies to, and where its symlink resolves (a dangling one shows as `BROKEN` instead of a silent 502).
 
 `<app>` is the first comma-separated value of `domain:` from `.yaml` (wildcards stripped: `*.foo` -> `foo`).
 
@@ -378,7 +422,7 @@ Consumers: humans, LLMs, monitoring scripts, and lux-deploy itself - `status`, `
 
 ## Template substitution
 
-Every template (`.env`, `.env.staging`, `caddy.conf`, and each `*.service` unit) is rendered in a single pass with the same vars:
+Every template (the branch's `.env.*`, `caddy.conf`, and each `*.service` unit) is rendered in a single pass with the same vars:
 
 1. **Git** (computed locally): `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`
 2. **App** (derived from `domain:`): `{{APP}}`, `{{APP_UNDERSCORE}}`, `{{HASH}}` (`h` + first 6 SHA-256 hex chars of the main domain), `{{TAG}}` (`s` + first 5 SHA-256 hex chars of the main domain)
@@ -400,8 +444,10 @@ Behavioral keys (`service_user`, `remote_base`, `service_prefix`, `on_fail`, `sr
 
 ```
  1. read config/deploy/.yaml and optional config/deploy/src
- 2. derive <app> from yaml `domain:` (first comma-split, strip leading "*.")
- 3. pick the env template: .env.<branch> if present, else master|main -> .env, else .env.staging
+ 2. derive <app_domain> from yaml `domain:` (first comma-split, strip leading "*.")
+ 2b. resolve the branch: main serves `domain:`, any other branch gets `branch_domain:`
+     -> app = <app_domain>-<branch>, dir = <remote_base>/<app_domain>/<branch>
+ 3. pick the env template: .env.<branch> if present, else master|main -> .env.main, else .env.default
  4. local_before.sh   (LOCAL, if present; non-zero exit -> abort)
  5. ensure remote dirs (service_user-owned)
  6. take the deploy lock (<app_dir>/.deploy.lock)

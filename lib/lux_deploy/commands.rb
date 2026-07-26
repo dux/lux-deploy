@@ -115,8 +115,13 @@ module LuxDeploy
         systemctl reload caddy || true
       SH
 
+      # Only this branch's dir goes. The parent holds the app's other branches,
+      # so it is pruned only once the last one is gone.
       step "rm -rf #{ctx.app_dir}"
-      ctx.ssh.run("rm -rf #{Shellwords.escape(ctx.app_dir)}", as: :service, allow_fail: true)
+      ctx.ssh.run(<<~SH, as: :service, allow_fail: true)
+        rm -rf #{Shellwords.escape(ctx.app_dir)}
+        rmdir #{Shellwords.escape(ctx.app_root)} 2>/dev/null || true
+      SH
 
       step 'done.'
     end
@@ -279,6 +284,65 @@ module LuxDeploy
       step "done. #{IMPORTER_UNIT} scanning #{config.remote_base}/*/log (retain #{IMPORTER_RETAIN}d)"
     end
 
+    # Host-wide caddy inspection: is it installed, running, importing our dir -
+    # then one row per site file, resolved through the symlink to the app dir
+    # that owns it. Read-only; `doctor` fixes the host, this explains it.
+    def caddy_doctor(opts)
+      config = Config.load
+      ssh    = prepare_ssh(opts)
+      step "caddy on #{ssh.host}"
+
+      %w[installed running imports\ sites].zip([
+        'command -v caddy >/dev/null && caddy version | head -n1',
+        'systemctl is-active caddy',
+        "grep -Rhq 'import #{CADDY_SITES}/\\*.caddy' /etc/caddy/ && echo yes || echo NO"
+      ]).each do |label, cmd|
+        out = ssh.run(cmd, allow_fail: true).lines.first.to_s.strip
+        puts format('  %-14s %s', label, out.empty? ? 'NO' : out)
+      end
+
+      rows = caddy_site_rows(ssh, config)
+      puts "\n  sites in #{CADDY_SITES}"
+      return puts('    (none)') if rows.empty?
+
+      head  = %w[SITE DOMAINS UPSTREAM TARGET]
+      width = head.each_index.map { |i| ([head[i]] + rows.map { |r| r[i] }).map(&:length).max }
+      [head, *rows].each do |r|
+        puts '    ' + r.each_with_index.map { |c, i| c.ljust(width[i]) }.join('  ').rstrip
+      end
+    end
+
+    # One row per *.caddy: the link name, the site addresses it declares, the
+    # upstream it proxies to, and where the symlink actually resolves. A
+    # dangling link shows up as a BROKEN target instead of a silent 502.
+    def caddy_site_rows(ssh, _config)
+      raw = ssh.run(<<~SH, allow_fail: true)
+        for f in #{CADDY_SITES}/*.caddy; do
+          [ -e "$f" ] || { [ -L "$f" ] && echo "__SITE__ $(basename "$f")|BROKEN -> $(readlink "$f")|"; continue; }
+          echo "__SITE__ $(basename "$f")|$(readlink -f "$f")|"
+          cat "$f"
+        done
+      SH
+
+      raw.split('__SITE__ ').drop(1).filter_map do |chunk|
+        header, body = chunk.split("\n", 2)
+        name, target = header.to_s.split('|')
+        next unless name
+        [name.sub(/\.caddy\z/, ''),
+         site_addresses(body).join('; '),
+         body.to_s[/reverse_proxy\s+(\S+)/, 1] || '-',
+         target.to_s.strip]
+      end
+    end
+
+    # Site addresses are the top-level lines ending in "{" - which excludes
+    # snippet definitions "(name) {", matchers "@name {", and every indented
+    # directive block inside a site.
+    def site_addresses(body)
+      lines = body.to_s.lines.grep(/\A[^\s(#@].*\{\s*\z/).map { |l| l.sub(/\s*\{\s*\z/, '').strip }
+      lines.empty? ? ['?'] : lines
+    end
+
     # Per-app inspection: host-wide importer unit status + this app's log dir
     # listing + SQLite stats (row count, ts span, checkpoint).
     def caddy_log_status(opts)
@@ -328,7 +392,8 @@ module LuxDeploy
         end
       end
 
-      $stderr.puts "done. edit #{dest_dir}/.env (SECRET, DOMAIN) and #{dest_dir}/.yaml, then run 'lux-deploy doctor' and 'lux-deploy up'"
+      $stderr.puts "done. set server: + domain: in #{dest_dir}/.yaml and ExecStart in #{dest_dir}/systemd.service,"
+      $stderr.puts "      then run 'lux-deploy doctor' and 'lux-deploy up'. Secrets go on the server: lux-deploy env:set KEY=VALUE"
     end
 
     # -------- env:* --------------------------------------------------------
@@ -484,7 +549,7 @@ module LuxDeploy
       step "apps in #{config.remote_base} on #{ssh.host}"
 
       raw = ssh.run(<<~SH, allow_fail: true)
-        for f in #{Shellwords.escape(config.remote_base)}/*/#{Manifest::FILENAME}; do
+        for f in #{Shellwords.escape(config.remote_base)}/*/*/#{Manifest::FILENAME}; do
           [ -f "$f" ] || continue
           echo "__APP__ $f"
           cat "$f"
@@ -889,8 +954,10 @@ module LuxDeploy
     # caddy.conf references {{PORT}}.
     def needed_port_keys(ctx)
       keys = []
-      [ctx.env_template_name, '.env'].uniq.each do |n|
-        src = ctx.template_source(n) or next
+      # Only the env template this branch actually uses - every branch is its
+      # own deploy with its own ports, so another branch's declarations are
+      # none of its business.
+      if (src = ctx.template_source(ctx.env_template_name))
         keys.concat(src.scan(/^(PORT[A-Z0-9_]*)\s*=/).flatten)
       end
       (['caddy.conf'] + ctx.services.map(&:template)).uniq.each do |n|
@@ -922,8 +989,9 @@ module LuxDeploy
     # mid-deploy, between destroy and up) would have its port handed to the
     # next app. The .env files stay the record - no ledger to keep in sync.
     def claimed_ports(ctx)
-      # remote_base is escaped but the glob is not - it has to expand remotely.
-      ctx.ssh.run("grep -hE '^PORT[A-Z0-9_]*=' #{Shellwords.escape(ctx.config.remote_base)}/*/.env 2>/dev/null || true",
+      # <remote_base>/<domain>/<branch>/.env - remote_base is escaped but the
+      # globs are not, they have to expand remotely.
+      ctx.ssh.run("grep -hE '^PORT[A-Z0-9_]*=' #{Shellwords.escape(ctx.config.remote_base)}/*/*/.env 2>/dev/null || true",
                   as: :service, allow_fail: true)
         .lines.filter_map { |l| l.strip =~ /^PORT[A-Z0-9_]*=(\d+)/ ? $1.to_i : nil }.to_set
     end
@@ -1086,11 +1154,18 @@ module LuxDeploy
       'config/deploy/after_server.sh'  => REMOTE_AFTER_HOOK
     }.freeze
 
+    # Every branch is its own deploy now, so the env templates are named for
+    # which branch they serve rather than for an environment.
+    RENAMED_FILES ||= RENAMED_HOOKS.merge(
+      'config/deploy/.env'         => 'config/deploy/.env.main',
+      'config/deploy/.env.staging' => 'config/deploy/.env.default'
+    ).freeze
+
     def check_renamed_hooks!
-      stale = RENAMED_HOOKS.select { |old, _| File.exist?(old) }
+      stale = RENAMED_FILES.reject { |old, new| !File.exist?(old) || File.exist?(new) }
       return if stale.empty?
       body = stale.map { |old, new| "  mv #{old} #{new}" }.join("\n")
-      raise Error.new("lifecycle hooks were renamed; rename these files:\n#{body}")
+      raise Error.new("these files were renamed; rename them and re-run:\n#{body}")
     end
 
     # Pre-flight gate. Runs locally in the project root before any remote

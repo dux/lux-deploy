@@ -5,9 +5,19 @@ module LuxDeploy
     # any other config/deploy/<name>.service becomes <prefix>-<app>-<name>.
     Service ||= Struct.new(:name, :template, :artifact, :unit, :web)
 
-    attr_reader :host, :ssh, :branch, :app, :app_dir, :config_dir,
-                :env_template_name, :config, :templates_dir
+    attr_reader :host, :ssh, :branch, :branch_slug, :app, :app_dir, :app_domain,
+                :domain_list, :config_dir, :env_template_name, :config, :templates_dir
     attr_accessor :ports, :domain, :rendered
+
+    # True on master/main - the branch whose deploy serves `domain:` verbatim.
+    def main_branch? = @main
+
+    # Parent of every branch's dir: <remote_base>/<app_domain>/. Only pruned
+    # by destroy, never created or removed on its own.
+    def app_root = File.join(config.remote_base, @app_domain)
+
+    # Domains this deploy serves, split out of domain_list.
+    def domains = @domain_list.split(',').map(&:strip).reject(&:empty?)
 
     # Primary web port. Convenience for the manifest / done line; the full
     # set (PORT, PORT_*) lives in #ports.
@@ -32,6 +42,10 @@ module LuxDeploy
       Template.git_vars.merge(config.template_vars).merge(
         APP: @app,
         APP_UNDERSCORE: @app.gsub(/[^A-Za-z0-9]+/, '_'),
+        APP_DOMAIN: @app_domain,
+        # Overrides the raw yaml value: on a branch this is the branch host, so
+        # caddy.conf needs no branch awareness of its own.
+        DOMAIN: @domain_list,
         HASH: domain_hash,
         TAG: domain_tag
       )
@@ -125,32 +139,56 @@ module LuxDeploy
       @host = (opts[:server].to_s.strip.empty? ? @config.server : opts[:server]).to_s.strip
       raise Error.new("no server set (.yaml 'server:' or --server)") if @host.empty?
 
-      @ssh    = SSH.new(@host, service_user: @config.service_user, dry_run: opts[:dry_run] || false)
-      @branch = Template.git_vars[:GIT_BRANCH]
-      @env_template_name = pick_env_template(@branch)
+      @ssh         = SSH.new(@host, service_user: @config.service_user, dry_run: opts[:dry_run] || false)
+      @branch      = Template.git_vars[:GIT_BRANCH]
+      @branch_slug = Template.slug(@branch)
+      raise Error.new("branch #{@branch.inspect} has no usable slug") if @branch_slug.empty?
+      @main = LuxDeploy::MAIN_BRANCHES.include?(@branch)
+      @env_template_name = pick_env_template
 
-      # App slug comes from yaml `domain:` only. Multi-host strings like
-      # "foo.com, *.foo" are allowed; the slug is the first comma-split
-      # segment with any leading "*." stripped.
+      # The app's identity domain, independent of branch: first comma-split
+      # segment of yaml `domain:`, with any leading "*." stripped.
       raw = @config.domain.to_s
       raise Error.new("config/deploy/.yaml: 'domain:' is empty") if raw.strip.empty?
-      domain = raw.split(',').first.to_s.strip.sub(/^\*\./, '')
-      raise Error.new('domain resolved to empty') if domain.empty?
-      @app     = domain
-      @domain  = domain
-      @app_dir = File.join(@config.remote_base, domain)
+      @app_domain = raw.split(',').first.to_s.strip.sub(/^\*\./, '')
+      raise Error.new('domain resolved to empty') if @app_domain.empty?
+
+      # What this deploy serves. main gets `domain:` verbatim (multi-host
+      # allowed); every other branch gets its own host, so two branches never
+      # claim the same site address in caddy.
+      @domain_list = @main ? raw.strip : render_branch_domain
+      @domain      = @domain_list.split(',').first.to_s.strip.sub(/^\*\./, '')
+
+      # Identity vs location. The slug names the systemd unit and the caddy
+      # file, both of which live in flat directories; the app dir nests so
+      # every branch of one app sits under a single parent.
+      @app     = "#{@app_domain}-#{@branch_slug}"
+      @app_dir = File.join(@config.remote_base, @app_domain, @branch_slug)
     end
 
-    # A per-branch `.env.<branch>` wins when it exists (slashes underscored, so
-    # feature/x -> .env.feature_x), otherwise the historical main/staging split.
-    # `.env.local` is never a branch template - it is the name of the
-    # server-side overlay, and a branch called "local" must not hijack it.
-    def pick_env_template(branch)
-      [".env.#{branch}", ".env.#{branch.gsub(/[^A-Za-z0-9]+/, '_')}"].uniq.each do |name|
-        next if name == '.env.local'
-        return name if template_source(name)
-      end
-      LuxDeploy::MAIN_BRANCHES.include?(branch) ? '.env' : '.env.staging'
+    # `branch_domain:` is rendered against a deliberately small var set - it
+    # resolves before the full namespace exists, and Template.render raises on
+    # anything else, which is the error message we want.
+    def render_branch_domain
+      Template.render(@config.branch_domain,
+                      Template.git_vars.merge(APP_DOMAIN: @app_domain)).strip
+    end
+
+    # First hit wins: an exact per-branch file, then its slugged form, then
+    # main-vs-everything-else. `.env.local` is never a branch template - it is
+    # the name of the server-side overlay, and a branch called "local" must
+    # not hijack it.
+    def env_template_candidates
+      list = [".env.#{@branch}", ".env.#{@branch_slug}"]
+      list << '.env.main' if @main
+      list << '.env.default'
+      list.uniq.reject { |n| n == '.env.local' }
+    end
+
+    def pick_env_template
+      candidates = env_template_candidates
+      candidates.each { |name| return name if template_source(name) }
+      raise Error.new("no env template for branch #{@branch}; looked for #{candidates.join(', ')}")
     end
 
     def detect_ruby_path
