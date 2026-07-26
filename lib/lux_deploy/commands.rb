@@ -549,7 +549,7 @@ module LuxDeploy
       step "apps in #{config.remote_base} on #{ssh.host}"
 
       raw = ssh.run(<<~SH, allow_fail: true)
-        for f in #{Shellwords.escape(config.remote_base)}/*/*/#{Manifest::FILENAME}; do
+        for f in #{Shellwords.escape(config.remote_base)}/*/#{Manifest::FILENAME} #{Shellwords.escape(config.remote_base)}/*/*/#{Manifest::FILENAME}; do
           [ -f "$f" ] || continue
           echo "__APP__ $f"
           cat "$f"
@@ -989,9 +989,11 @@ module LuxDeploy
     # mid-deploy, between destroy and up) would have its port handed to the
     # next app. The .env files stay the record - no ledger to keep in sync.
     def claimed_ports(ctx)
-      # <remote_base>/<domain>/<branch>/.env - remote_base is escaped but the
-      # globs are not, they have to expand remotely.
-      ctx.ssh.run("grep -hE '^PORT[A-Z0-9_]*=' #{Shellwords.escape(ctx.config.remote_base)}/*/*/.env 2>/dev/null || true",
+      # <remote_base>/<domain>/<branch>/.env, plus the pre-0.3 one-level layout
+      # so an app that has not been redeployed yet still holds its ports.
+      # remote_base is escaped; the globs are not, they expand remotely.
+      base = Shellwords.escape(ctx.config.remote_base)
+      ctx.ssh.run("grep -hE '^PORT[A-Z0-9_]*=' #{base}/*/.env #{base}/*/*/.env 2>/dev/null || true",
                   as: :service, allow_fail: true)
         .lines.filter_map { |l| l.strip =~ /^PORT[A-Z0-9_]*=(\d+)/ ? $1.to_i : nil }.to_set
     end

@@ -334,12 +334,12 @@ A `!`-disabled service is *not* torn down automatically - stop its unit on the b
 
 **Ports are magic**: any token matching `PORT*` is auto-allocated, persisted into the remote `.env` (0600), and reused on every later deploy.
 The set is the union of `PORT*` keys in the branch's env template and `{{PORT*}}` placeholders in any template.
-So a worker that needs its own port just references `{{PORT_JOB}}` in its unit (and/or declares `PORT_JOB=` in `.env`); the web service keeps its single `{{PORT}}`.
+So a worker that needs its own port just references `{{PORT_JOB}}` in its unit (and/or declares `PORT_JOB=` in the branch's env template); the web service keeps its single `{{PORT}}`.
 The host is only probed when something new must be allocated - reuse never touches the network.
 When it does probe, it excludes both the ports currently listening (`ss -tln`) and every `PORT*` claimed in any app's `.env` on the host, so an app that happens to be stopped does not lose its port to the next deploy.
 
 ```
-# config/deploy/.env            after first deploy (persisted on server):
+# config/deploy/.env.main       after first deploy (persisted on server):
 PORT=                           PORT=3010
 PORT_JOB=                       PORT_JOB=3020
 ```
@@ -489,7 +489,45 @@ Caddy is only reloaded after the gate passes, so on a first deploy - or any depl
 
 ## Notes
 
-* `lux-deploy destroy` prompts `type '<domain>' to confirm` unless `--yes`.
-* `lux-deploy redeploy` wipes the app dir, so all `PORT*` are re-allocated fresh.
-* Concurrent deploys of the same app are refused: `up` takes `<app_dir>/.deploy.lock` and reports who holds it. A lock older than 60 minutes is presumed dead and broken automatically; `--force` breaks one on demand.
+* `lux-deploy destroy` prompts `type '<domain>' to confirm` unless `--yes`, and removes only the current branch.
+* `lux-deploy redeploy` wipes this branch's dir, so its `PORT*` are re-allocated fresh.
+* Concurrent deploys of the same branch are refused: `up` takes `<app_dir>/.deploy.lock` and reports who holds it. A lock older than 60 minutes is presumed dead and broken automatically; `--force` breaks one on demand.
 * The swap at step 15 is two `mv` calls, so there is a sub-second window in which `release/` does not exist. A unit that crash-restarts inside that window fails to start and is picked up by the next `Restart=always` cycle.
+
+## Upgrading to 0.3.0
+
+Three renames and one moved directory. Nothing on a running host changes until you deploy.
+
+**1. Env templates.** `up` aborts with a `mv` hint if it finds the old names:
+
+```sh
+git mv config/deploy/.env         config/deploy/.env.main
+git mv config/deploy/.env.staging config/deploy/.env.default
+```
+
+`.env.default` no longer needs to build its own hostname - `DOMAIN={{DOMAIN}}` is already the branch host. Delete any `DOMAIN={{GIT_BRANCH}}.staging.{{DOMAIN}}` line.
+
+**2. Production moves one level down.** A `main` deploy that used to live at `<remote_base>/example.com/` now lives at `<remote_base>/example.com/main/`, and its unit renames from `web-example.com` to `web-example.com-main`.
+
+The next `up` builds the new location alongside the old one and leaves the old one serving - lux-deploy will not delete a live production directory on your behalf. Cut over when the new one looks right:
+
+```sh
+lux-deploy up                              # creates apps/example.com/main, new unit, new caddy file
+lux-deploy status                          # confirm it is live and healthy
+lux-deploy caddy:doctor                    # both site files will be listed here
+
+# then, once, on the host:
+systemctl disable --now web-example.com
+rm -f /etc/systemd/system/web-example.com.service /etc/caddy/sites/example.com.caddy
+systemctl daemon-reload && systemctl reload caddy
+rm -rf <remote_base>/example.com/release <remote_base>/example.com/old-release \
+       <remote_base>/example.com/shared  <remote_base>/example.com/.env* \
+       <remote_base>/example.com/*.service <remote_base>/example.com/caddy.config \
+       <remote_base>/example.com/lux-deploy.yaml
+```
+
+Both site files declare the same domains while they coexist, so reload caddy only after one of them is gone. Port allocation reads both layouts, so a pre-0.3 app keeps its ports reserved until you remove it.
+
+**3. `prepare:nginx` is gone.** It installed nginx but no deploy could ever emit an nginx site file. See *Why Caddy, and only Caddy* above.
+
+Also new in 0.3.0: the health gate (`health:`, `boot_timeout:`, `health_path:`, `config/deploy/health.sh`), `rollback` + `on_fail:`, `env:list/get/set/edit` over a server-side `.env.local`, `status`, `host:apps`, `caddy:doctor`, and a deploy lock.
