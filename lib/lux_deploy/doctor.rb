@@ -84,7 +84,8 @@ module LuxDeploy
     # Lifecycle hooks (run during `up` if present in config/deploy/).
     # Optional - doctor reports their presence/absence, never creates.
     # Scaffolds with explanatory header comments ship via `app:init`.
-    HOOK_FILES ||= %w[local_before.sh remote_before.sh remote_after.sh local_after.sh].freeze
+    HOOK_FILES ||= %w[local_before.sh remote_before.sh remote_after.sh local_after.sh
+                      health.sh].freeze
 
     # True when any local config/deploy template references {{RUBY}}. Gates
     # the ruby/bundler host checks so a Go/Python app doesn't fail doctor.

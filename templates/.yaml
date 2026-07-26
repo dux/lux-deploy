@@ -14,4 +14,7 @@ domain: example.com
 # remote_base:        /home/deployer/apps
 # service_prefix:     web                     # systemd unit: <prefix>-<app>.service
 # src:                ./                      # local dir rsync ships (config/deploy/src wins)
-# on_fail:            keep                    # keep | rollback, when remote_after.sh fails
+# on_fail:            keep                    # keep | rollback, when a post-swap step fails
+# health:             true                    # false disables the port-contract wait
+# boot_timeout:       30                      # seconds to wait for the app to bind PORT
+# health_path:                                # e.g. /up - adds an HTTP probe on top

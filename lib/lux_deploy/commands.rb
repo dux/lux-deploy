@@ -64,10 +64,12 @@ module LuxDeploy
       step 'install systemd + caddy symlinks'
       install_system_symlinks(ctx)
 
-      step 'reload services'
-      reload_services(ctx)
-
-      run_remote_after_hook_or_rollback(ctx, opts)
+      # Everything past the swap shares one failure policy: `keep` fails loudly
+      # and leaves the release live, `rollback` puts the previous one back.
+      with_failure_policy(ctx, opts) do
+        restart_and_verify(ctx)
+        run_remote_after_hook(ctx)
+      end
 
       step "write #{Manifest::FILENAME}"
       upload_manifest(ctx)
@@ -178,8 +180,9 @@ module LuxDeploy
       step 'install systemd + caddy symlinks'
       install_system_symlinks(ctx, new_units)
 
-      step 'reload services'
-      reload_services(ctx, new_units)
+      # No failure policy here - if the restored release is also unhealthy,
+      # rolling back again would just oscillate. Fail and say so.
+      restart_and_verify(ctx, new_units)
 
       step "done. rolled back to #{RemoteState.commit(to)} - https://#{ctx.domain}"
     end
@@ -414,8 +417,8 @@ module LuxDeploy
       end
       write_remote_file(ctx, "#{ctx.app_dir}/.env", merge_env(live, read_env_overlay(ctx)), mode: '0600')
 
-      step 'restart services'
-      reload_services(ctx, RemoteState.services(ctx))
+      # Caddy config did not change, so there is nothing to reload there.
+      restart_and_verify(ctx, RemoteState.services(ctx), reload_proxy: false)
     end
 
     # -------- status / host:apps -------------------------------------------
@@ -448,9 +451,37 @@ module LuxDeploy
         ports.each { |k, v| puts "    #{k}=#{v} #{listening.include?(v.to_i) ? 'listening' : 'NOT listening'}" }
       end
 
+      report_wiring(ctx, units)
+
       has_old = ctx.ssh.run("[ -d #{Shellwords.escape(ctx.app_dir)}/old-release ] && echo yes || echo no",
                             as: :service, allow_fail: true)
       puts "  rollback    #{has_old.include?('yes') ? 'available (lux-deploy rollback)' : 'unavailable'}"
+    end
+
+    # Symlinks are the whole install: /etc/caddy/sites and /etc/systemd/system
+    # point back into <app_dir>. A dangling one is invisible until traffic
+    # arrives, so `status` resolves each and re-checks the port contract end to
+    # end - what caddy proxies to must be what .env says.
+    def report_wiring(ctx, units)
+      links = [[CADDY_SITES, "#{ctx.app}.caddy"]] +
+              units.map { |s| [SYSTEMD_DIR, "#{s.unit}.service"] }
+
+      out = ctx.ssh.run(<<~SH, allow_fail: true)
+        for l in #{links.map { |dir, name| Shellwords.escape("#{dir}/#{name}") }.join(' ')}; do
+          if [ -L "$l" ] && [ -e "$l" ]; then echo "ok       $l -> $(readlink "$l")"
+          elif [ -L "$l" ];               then echo "BROKEN   $l -> $(readlink "$l")"
+          else                                 echo "MISSING  $l"
+          fi
+        done
+      SH
+      puts '  wiring'
+      out.lines.map(&:rstrip).reject(&:empty?).each { |l| puts "    #{l}" }
+
+      upstream = read_remote_file(ctx, "#{ctx.app_dir}/caddy.config")[/reverse_proxy\s+\S*?:(\d+)/, 1]
+      env_port = read_existing_ports(ctx)[:PORT]
+      return unless upstream && env_port
+      match = upstream.to_i == env_port
+      puts "    #{match ? 'ok      ' : 'MISMATCH'} caddy proxies to :#{upstream}, .env PORT=#{env_port}"
     end
 
     # Every app on the host, straight from the manifests. One ssh round trip.
@@ -589,6 +620,124 @@ module LuxDeploy
       "#{body} #{Shellwords.escape(path)}"
     end
 
+    # -------- health gate --------------------------------------------------
+
+    # The port contract, checked. lux-deploy handed the app a PORT; this is
+    # where the engine confirms the app took it, before caddy is pointed at
+    # the new release and before remote_after.sh runs.
+    #
+    # Deliberately protocol-free: a listening socket is the whole contract, so
+    # it works for any language with nothing installed on the box. An HTTP
+    # probe is opt-in (`health_path:`), and config/deploy/health.sh replaces
+    # the built-in check entirely.
+    HEALTH_HOOK ||= 'config/deploy/health.sh'
+
+    def run_health_gate(ctx, services = ctx.services)
+      unless ctx.config.health?
+        step 'health gate disabled (health: false)'
+        return
+      end
+      return run_health_hook(ctx) if File.exist?(HEALTH_HOOK)
+
+      await_ports(ctx, gate_ports(ctx), services)
+      assert_units_active(ctx, services)
+    end
+
+    # `up` knows the ports it just allocated; rollback and env:set have to read
+    # them back out of the live .env.
+    def gate_ports(ctx)
+      ports = ctx.ports || read_existing_ports(ctx)
+      ports.reject { |_k, v| v.to_i.zero? }
+    end
+
+    def await_ports(ctx, ports, services)
+      if ports.empty?
+        step 'health gate: no ports to wait for'
+        return
+      end
+      timeout = ctx.config.boot_timeout
+      step "health gate: wait for #{ports.map { |k, v| "#{k}=#{v}" }.join(' ')} (#{timeout}s)"
+
+      out = ctx.ssh.run(<<~SH, allow_fail: true)
+        for p in #{ports.values.join(' ')}; do
+          up=
+          i=0
+          while [ $i -lt #{timeout} ]; do
+            if ss -tlnH | awk '{print $4}' | sed 's/.*://' | grep -qx "$p"; then up=1; break; fi
+            i=$((i + 1))
+            sleep 1
+          done
+          [ -n "$up" ] || { echo "__DOWN__ $p"; exit 1; }
+        done
+        #{http_probe_sh(ctx)}
+        echo __UP__
+      SH
+      return if out.include?('__UP__') || ctx.ssh.dry_run
+
+      dump_journal(ctx, services)
+      raise Error.new("health gate failed: #{gate_failure(out)}.\n" \
+                      "  The release is swapped in but is not serving. Fix and re-run `lux-deploy up`, " \
+                      "or `lux-deploy rollback`.")
+    end
+
+    # Optional HTTP probe on the web port, appended to the same remote script
+    # so it shares the one round trip. Empty unless `health_path:` is set.
+    def http_probe_sh(ctx)
+      path = ctx.config.health_path
+      port = (ctx.ports || read_existing_ports(ctx))[:PORT]
+      return '' unless path && port
+
+      <<~SH.chomp
+        if ! curl -fsS -m 5 -o /dev/null "http://127.0.0.1:#{port}#{path}"; then
+          echo "__UNHEALTHY__ http://127.0.0.1:#{port}#{path}"
+          exit 1
+        fi
+      SH
+    end
+
+    # A unit can bind its port and then die; systemd knows before we do.
+    def assert_units_active(ctx, services)
+      out = ctx.ssh.run(services.map { |s| "echo \"#{s.unit} $(systemctl is-active #{s.unit} 2>/dev/null)\"" }.join("\n"),
+                        allow_fail: true)
+      dead = out.lines.map(&:split).select { |_u, state| state && state != 'active' }
+      return if dead.empty?
+
+      dump_journal(ctx, services)
+      raise Error.new("health gate failed: #{dead.map { |u, s| "#{u} is #{s}" }.join(', ')}")
+    end
+
+    def gate_failure(out)
+      return "nothing listening on port #{$1}" if out =~ /__DOWN__ (\d+)/
+      return "#{$1} did not answer" if out =~ /__UNHEALTHY__ (\S+)/
+      'probe did not complete'
+    end
+
+    # The journal is the first thing anyone would look at next, so print it
+    # rather than making them go find it.
+    def dump_journal(ctx, services, lines: 40)
+      services.each do |s|
+        $stderr.puts "  --- journalctl -u #{s.unit} -n #{lines} ---"
+        ctx.ssh.stream("journalctl -u #{s.unit} -n #{lines} --no-pager", allow_fail: true)
+      end
+    end
+
+    # config/deploy/health.sh replaces the built-in probe outright - same shape
+    # as the other hooks (server, in release/, .env sourced), so "wire it up
+    # yourself" means editing a file you can already read.
+    def run_health_hook(ctx)
+      step "health gate: run #{HEALTH_HOOK} (server, in release, .env sourced)"
+      ok = ctx.ssh.stream(<<~SH, as: :service, allow_fail: true)
+        set -e
+        cd #{Shellwords.escape(ctx.app_dir)}/release
+        #{env_source_sh('.env')}
+        export BOOT_TIMEOUT=#{ctx.config.boot_timeout}
+        set -uo pipefail
+        source #{Shellwords.escape(HEALTH_HOOK)}
+      SH
+      return if ok
+      raise Error.new("#{HEALTH_HOOK} failed; the release is swapped in but is not serving.")
+    end
+
     # -------- deploy lock --------------------------------------------------
 
     # Two deploys of the same app at once interleave the rsync and the swap and
@@ -655,17 +804,32 @@ module LuxDeploy
     # Used by server:restart/log/status which target the web service.
     def web_unit(ctx) = "#{ctx.config.service_prefix}-#{ctx.app}"
 
-    # Enable + restart every discovered service, then reload caddy once.
-    # daemon-reload first so changed unit files are picked up. set -e aborts
-    # (and run raises) on the first failure.
-    def reload_services(ctx, services = ctx.services)
+    # Enable + restart every discovered service. daemon-reload first so changed
+    # unit files are picked up. set -e aborts (and run raises) on the first
+    # failure. Caddy is reloaded separately, after the health gate, so a
+    # release that never boots does not get traffic pointed at it.
+    def restart_services(ctx, services = ctx.services)
       lines = ['set -e', 'systemctl daemon-reload']
       services.each do |s|
         lines << "systemctl enable --now #{s.unit}"
         lines << "systemctl restart #{s.unit}"
       end
-      lines << 'systemctl reload caddy'
       ctx.ssh.run(lines.join("\n"))
+    end
+
+    def reload_caddy(ctx)
+      ctx.ssh.run('systemctl reload caddy')
+    end
+
+    # Restart, prove it came up, then point caddy at it. Used by `up`,
+    # `rollback` and `env:set` so all three get the same guarantee.
+    def restart_and_verify(ctx, services = ctx.services, reload_proxy: true)
+      step 'restart services'
+      restart_services(ctx, services)
+      run_health_gate(ctx, services)
+      return unless reload_proxy
+      step 'reload caddy'
+      reload_caddy(ctx)
     end
 
     def ensure_remote_dirs(ctx)
@@ -1013,18 +1177,18 @@ module LuxDeploy
       )
     end
 
-    # `on_fail: rollback` closes the loop the engine deliberately leaves open:
-    # remote_after.sh is the app's own verification, and if it says the release
-    # is bad we put the previous one back. Default stays `keep` - the release
-    # is live and the operator decides.
-    def run_remote_after_hook_or_rollback(ctx, opts)
-      run_remote_after_hook(ctx)
+    # Post-swap failures - the health gate or remote_after.sh - share one
+    # policy. `keep` (default) fails loudly and leaves the new release live;
+    # `rollback` puts the previous one back. Opt-in, because silent
+    # auto-rollback is exactly the kind of magic this gem avoids.
+    def with_failure_policy(ctx, opts)
+      yield
     rescue Error => e
       raise unless ctx.config.rollback_on_fail?
       warn e.to_s
       step 'on_fail: rollback - restoring the previous release'
       rollback(opts.merge(yes: true), from_services: ctx.services)
-      raise Error.new("#{REMOTE_AFTER_HOOK} failed; rolled back to the previous release")
+      raise Error.new('deploy failed after the swap; rolled back to the previous release')
     end
 
     # Post-deploy local hook. Runs in the project root after the remote deploy

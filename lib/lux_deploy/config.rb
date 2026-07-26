@@ -13,7 +13,10 @@ module LuxDeploy
       'service_user'   => 'deployer',
       'remote_base'    => '/home/deployer/apps',
       'service_prefix' => 'web',
-      'on_fail'        => 'keep'
+      'on_fail'        => 'keep',
+      'health'         => true,
+      'boot_timeout'   => 30,
+      'health_path'    => nil
     }.freeze
 
     # What `up` does when a post-swap step fails. `keep` leaves the new release
@@ -27,7 +30,7 @@ module LuxDeploy
     # `server` is also behavioral (target host) but historically exposed
     # as `{{SERVER}}` in caddy.conf, so it stays in template_vars.
     BEHAVIORAL_KEYS ||= %w[service_user remote_base service_prefix
-                           on_fail src].freeze
+                           on_fail health boot_timeout health_path src].freeze
 
     attr_reader :raw
 
@@ -70,6 +73,23 @@ module LuxDeploy
     end
 
     def rollback_on_fail? = on_fail == 'rollback'
+
+    # The port contract, enforced: after the restart lux-deploy waits for the
+    # app to bind the PORT it was handed. `health: false` turns the wait off
+    # (and config/deploy/health.sh replaces it entirely).
+    def health? = raw['health'] != false
+
+    def boot_timeout
+      v = raw['boot_timeout'].to_i
+      v.positive? ? v : 30
+    end
+
+    # Optional HTTP probe on top of the port wait, e.g. `health_path: /up`.
+    def health_path
+      v = raw['health_path'].to_s.strip
+      return nil if v.empty?
+      v.start_with?('/') ? v : "/#{v}"
+    end
 
     # Hash of UPPER_SYMBOL => string suitable for Template.render. Drops
     # behavioral keys (service_prefix etc.) so they don't pollute the

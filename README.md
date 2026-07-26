@@ -23,6 +23,23 @@ That is the entire interface between the engine and your code - no agent on the 
 Ports are allocated once and reused on every later deploy, so `PORT` is stable for the life of the app.
 Everything else (TLS, the reverse proxy, the systemd unit, access logs) is the engine's job, and every piece of it is a template you can edit.
 
+The contract is checked, not assumed.
+After restarting the units, `up` waits up to `boot_timeout` seconds (default 30) for something to be listening on every allocated `PORT*`, then asserts every unit is `active`.
+Only then does it reload Caddy and run `remote_after.sh`.
+A release that does not boot fails the deploy with the journal printed, instead of reporting `done` over a crash-looping process.
+
+```yaml
+health:        true    # false skips the wait entirely
+boot_timeout:  30      # seconds
+health_path:   /up     # optional: also require an HTTP 2xx on 127.0.0.1:$PORT/up
+```
+
+And if that is not the right check, `config/deploy/health.sh` **replaces** it - same shape as the other hooks (server, in `release/`, `.env` sourced), non-zero exit means the release is not serving.
+`app:init` ships it as `!health.sh` with the built-in check written out in bash; rename it to `health.sh` to take over.
+
+> This is a correctness gate, not zero-downtime. `PORT` is stable across deploys, so a restart is a gap on the same upstream rather than a switch to a new one - the gate tells you the new process came up, it does not hide the restart.
+> The shipped `caddy.conf` sets `lb_try_duration 10s`, which holds requests open through that gap instead of returning 502.
+
 ## Install
 
 ```sh
@@ -82,7 +99,10 @@ service_user:       deployer                # unix user that owns the app dir
 remote_base:        /home/deployer/apps     # ~/<remote_base>/<app>/
 service_prefix:     web                     # systemd units: <prefix>-<app>[-<svc>]
 src:                ./                      # local directory copied by rsync
-on_fail:            keep                    # keep | rollback, when remote_after.sh fails
+on_fail:            keep                    # keep | rollback, when a post-swap step fails
+health:             true                    # false disables the port-contract wait
+boot_timeout:       30                      # seconds to wait for the app to bind PORT
+health_path:                                # e.g. /up - adds an HTTP probe on top
 ```
 
 For a locally built deploy artifact, put its path in `config/deploy/src`.
@@ -123,7 +143,7 @@ It runs on the server inside `release/` after the atomic swap and service reload
 If the file exists and exits non-zero, `lux-deploy up` fails.
 
 By default the new release stays live and you decide what to do (`on_fail: keep`).
-Set `on_fail: rollback` in `.yaml` and a failing `remote_after.sh` restores the previous release automatically.
+Set `on_fail: rollback` in `.yaml` and any post-swap failure - the health gate or `remote_after.sh` - restores the previous release automatically.
 
 Use any command in any language: a ruby boot-eval, an rspec invocation, a shell script, a python test, a `curl` against the deployed URL, etc.
 You can re-run it directly with `lux-deploy on:remote:after`.
@@ -139,7 +159,8 @@ Every hook slot is announced on every deploy - missing hooks log `==> run config
 | --- | --- | --- | --- |
 | `local_before.sh`  | local repo root        | before any remote work (right after context build)                          | abort - no remote state changed |
 | `remote_before.sh` | server `new-release/`  | after rsync + .env upload, `.env` already sourced; before swap              | abort - `new-release/` kept, `release/` untouched |
-| `remote_after.sh`  | server `release/`      | after atomic swap + service reload, `.env` sourced                          | fail; rolls back only with `on_fail: rollback` |
+| `health.sh`        | server `release/`      | after the restart, replacing the built-in port wait; before caddy is reloaded | fail; rolls back only with `on_fail: rollback` |
+| `remote_after.sh`  | server `release/`      | after the health gate + caddy reload, `.env` sourced                        | fail; rolls back only with `on_fail: rollback` |
 | `local_after.sh`   | local repo root        | after the manifest is written and the deploy is live                        | warn - new release is already live |
 
 `remote_before.sh` is where you do the language-specific work - `bundle install`, `npm ci`, `go build`, migrations, asset compile.
@@ -197,7 +218,7 @@ lux-deploy status      # this app: commit, units, ports, rollback availability
 lux-deploy host:apps   # every app on the host, from their manifests
 ```
 
-`status` reads `<app_dir>/lux-deploy.yaml`, then asks systemd which units are active and checks whether anything is listening on each allocated port.
+`status` reads `<app_dir>/lux-deploy.yaml`, then asks systemd which units are active, checks whether anything is listening on each allocated port, resolves every `/etc/caddy/sites` and `/etc/systemd/system` symlink, and confirms that what Caddy proxies to is what `.env` says `PORT` is.
 `host:apps` reads every `<remote_base>/*/lux-deploy.yaml` in one round trip.
 
 ## Commands
@@ -250,6 +271,7 @@ config/deploy/
   .yaml                  # server: + domain: + any overrides + custom {{KEY}}s
   src                    # optional local rsync source; overrides .yaml src
   init.rb                # optional ruby loaded before any task
+  health.sh              # optional: replaces the built-in port-contract wait
   .env                   # production env (used on master/main)
   .env.staging           # staging env (used on any other branch)
   .env.<branch>          # optional per-branch env; wins when present
@@ -390,12 +412,17 @@ Behavioral keys (`service_user`, `remote_base`, `service_prefix`, `on_fail`, `sr
 15. release swap:  rm old-release; mv release old-release; mv new-release release
 16. ensure <app_dir>/log exists, if caddy.config emits a JSONL access log
 17. install symlinks under /etc/systemd/system and /etc/caddy/sites
-18. systemctl daemon-reload + enable/restart every service + reload caddy
-19. remote_after.sh   (SERVER, in release/, .env sourced; non-zero exit -> fail, or roll back with on_fail: rollback)
-20. write <app_dir>/lux-deploy.yaml and release/.lux-deploy/lux-deploy.yaml (manifest)
-21. local_after.sh    (LOCAL, if present; non-zero exit -> warn, deploy is already live)
-22. release the deploy lock
+18. systemctl daemon-reload + enable/restart every service
+19. health gate: wait for every PORT* to be listening, assert every unit is active
+                       (or run config/deploy/health.sh instead, if it exists)
+20. systemctl reload caddy   <- traffic only now points at the new release
+21. remote_after.sh   (SERVER, in release/, .env sourced)
+22. write <app_dir>/lux-deploy.yaml and release/.lux-deploy/lux-deploy.yaml (manifest)
+23. local_after.sh    (LOCAL, if present; non-zero exit -> warn, deploy is already live)
+24. release the deploy lock
 ```
+
+Steps 19-21 share one failure policy: non-zero fails the command, and with `on_fail: rollback` the previous release is restored first.
 
 Render happens *after* rsync because the ruby probe globs for a mise-installed ruby, and mise only knows what to install once the app's `mise.toml` is on the box.
 
@@ -404,7 +431,8 @@ Every lifecycle hook step is always announced - if the file is missing the line 
 On any failure between step 9 and step 14, `release/` is untouched and `new-release/` is left in place on the server (path printed in the error).
 `lux-deploy server:ssh` to inspect; the next `lux-deploy up` wipes `new-release/` at step 7.
 Run `lux-deploy on:remote:before` to re-run the server-side pre-swap hook against the current `new-release/`.
-If `remote_after.sh` fails at step 19, the command fails and the new release stays live unless `on_fail: rollback` is set.
+If the health gate or `remote_after.sh` fails (steps 19-21), the swap has already happened: the command fails and the new release stays in place unless `on_fail: rollback` is set.
+Caddy is only reloaded after the gate passes, so on a first deploy - or any deploy that changed `caddy.conf` - traffic is never pointed at a release that did not come up.
 
 ## Notes
 
