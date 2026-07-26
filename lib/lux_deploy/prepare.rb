@@ -1,9 +1,13 @@
 module LuxDeploy
-  # Host bootstrap for the reverse proxy. Installs the package, creates the
-  # per-site config dir, wires the include/import directive, enables + starts
-  # the service. Host setup only - the deploy flow is caddy-fronted and
-  # unchanged. Every step is idempotent so re-running is safe. Debian/Ubuntu
-  # (apt), matching the rest of the gem's host assumptions.
+  # Host bootstrap: install a package, create the dirs it needs, wire the
+  # directive, enable + start the service. Every step is idempotent so
+  # re-running is safe. Debian/Ubuntu (apt), matching the rest of the gem's
+  # host assumptions.
+  #
+  # Caddy is the reverse proxy, not one option among several: it does ACME
+  # itself, validates config before an atomic reload, and emits the JSON
+  # access log the caddy:log:* importer reads. Swapping it out means
+  # replacing all three, which is a different gem - see lux_deploy.rb.
   module Prepare
     module_function
 
@@ -124,27 +128,5 @@ module LuxDeploy
       SH
     end
 
-    def nginx(ssh)
-      ssh.stream(<<~SH)
-        set -e
-        if command -v nginx >/dev/null; then
-          echo "nginx already installed: $(nginx -v 2>&1)"
-        else
-          echo "installing nginx"
-          apt-get update
-          apt-get install -y nginx
-        fi
-
-        install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
-        if ! grep -q 'include /etc/nginx/sites-enabled/' /etc/nginx/nginx.conf; then
-          echo "wiring include into /etc/nginx/nginx.conf http{} block"
-          sed -i 's|^\\(\\s*\\)http {|\\1http {\\n    include /etc/nginx/sites-enabled/*;|' /etc/nginx/nginx.conf
-        fi
-
-        systemctl enable --now nginx
-        nginx -t
-        systemctl reload nginx || systemctl restart nginx
-      SH
-    end
   end
 end

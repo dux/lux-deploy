@@ -70,18 +70,26 @@ bundle exec lux-deploy status        # what is live
 
 ```sh
 lux-deploy prepare:caddy     # install Caddy, create /etc/caddy/sites, wire the import, enable
-lux-deploy prepare:nginx     # install nginx, create sites-enabled, wire the include, enable
 lux-deploy prepare:mise      # install mise for the service user, activate it in the login shell
 lux-deploy prepare:bun       # install Bun for the service user
 lux-deploy caddy:log:prepare # install Bun + the host-wide access-log -> SQLite importer
 ```
 
-The proxy tasks target Debian/Ubuntu (apt) and run as root over SSH.
-This is the one gap `doctor` does not close on its own: `doctor` *checks* that the proxy and mise are installed and wired, but never installs them for you - `prepare:*` does.
+These target Debian/Ubuntu (apt) and run as root over SSH.
+This is the one gap `doctor` does not close on its own: `doctor` *checks* that Caddy and mise are installed and wired, but never installs them for you - `prepare:*` does.
 `prepare:mise` installs mise under the service user and wires `mise activate bash` into `~/.profile`, so the login shell every remote deploy step uses (`sudo -iu <user> bash -lc`) resolves `ruby`/`bundle`.
 
-The deploy flow itself is **Caddy-fronted**: `up` renders a `caddy.config` and links it into `/etc/caddy/sites/<app>.caddy`.
-`prepare:nginx` installs and wires nginx as host groundwork, but the deploy does not yet emit nginx site files - use it when you are setting up nginx for other purposes on the box, or as the basis for a custom proxy setup.
+### Why Caddy, and only Caddy
+
+`up` renders a `caddy.config` and links it into `/etc/caddy/sites/<app>.caddy`.
+There is no nginx path, and that is deliberate rather than unfinished: three things the gem does for free are Caddy doing the work.
+
+* **TLS.** Caddy handles ACME itself - issuance, renewal, stapling. The whole TLS story here is `{{DOMAIN}} { ... }`. nginx would mean certbot, a renewal timer, a reload hook and per-site certificate paths.
+* **Reload safety.** Caddy validates before an atomic swap, so a broken site file fails the reload and leaves the running config alone. A bad `nginx -t` followed by a reload takes down every site on the box, not just yours - a bad blast radius for a per-app deploy tool.
+* **Access logs.** The `caddy:log:*` importer reads Caddy's native JSON log, and `roll_size`/`roll_keep` are Caddy directives. nginx has no JSON log; you would hand-build a `log_format`, add logrotate, and rewrite the importer.
+
+If you want a different proxy, replace all three - which is a different gem, not a config flag.
+The same reasoning applies to systemd and Debian: see the note at the top of `lib/lux_deploy.rb`.
 
 ## Configuration: `config/deploy/.yaml`
 
@@ -239,7 +247,6 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | `lux-deploy host:apps` | list every app deployed on the host |
 | `lux-deploy log`       | list `release/log/`, or dump one with `--log <name> --lines 200` |
 | `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
-| `lux-deploy prepare:nginx` | install + configure nginx on the host (sites-enabled, enable) |
 | `lux-deploy prepare:mise` | install mise for the service user + activate it in the login shell |
 | `lux-deploy prepare:bun` | install Bun for the service user |
 | `lux-deploy caddy:log:prepare` | install Bun + the host-wide access-log -> SQLite importer |

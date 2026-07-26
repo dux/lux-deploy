@@ -237,11 +237,11 @@ module LuxDeploy
       Doctor.run(ssh, config, fix: opts.fetch(:fix, true), dry_run: opts[:dry_run] || false)
     end
 
-    # -------- prepare:caddy / prepare:nginx -------------------------------
+    # -------- prepare:* ----------------------------------------------------
 
-    # Bootstrap the reverse proxy on the host (install, sites dir, directive,
-    # enable). Host setup only - the deploy flow stays caddy-fronted. Builds
-    # ssh directly from host + config (no app/domain resolution needed).
+    # Bootstrap the host (install, sites dir, directive, enable). Host setup
+    # only. Builds ssh directly from host + config (no app/domain resolution
+    # needed).
 
     def prepare_caddy(opts)
       ssh = prepare_ssh(opts)
@@ -255,13 +255,6 @@ module LuxDeploy
       step "prepare mise on #{ssh.host}"
       Prepare.mise(ssh)
       step "done. mise installed for #{ssh.service_user}, activated in login shell"
-    end
-
-    def prepare_nginx(opts)
-      ssh = prepare_ssh(opts)
-      step "prepare nginx on #{ssh.host}"
-      Prepare.nginx(ssh)
-      step 'done. nginx installed, sites-enabled wired, service running'
     end
 
     def prepare_bun(opts)
