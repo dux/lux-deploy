@@ -9,6 +9,7 @@ module LuxDeploy
       step "deploy #{ctx.app} (branch #{ctx.branch}) -> #{ctx.host}"
 
       check_renamed_hooks!
+      check_legacy_layout!(ctx)
       run_local_before_hook(ctx)
 
       ensure_remote_dirs(ctx)
@@ -99,6 +100,9 @@ module LuxDeploy
     def destroy(opts)
       ctx = Context.build(opts)
       step "destroy #{ctx.app} on #{ctx.host}"
+      # Without this, destroy would tear down units and a directory that do not
+      # exist yet and report success, leaving the real app running.
+      check_legacy_layout!(ctx)
       confirm_destroy!(ctx) unless opts[:yes]
 
       # Units come from the remote manifest, not the local config/deploy scan -
@@ -124,6 +128,93 @@ module LuxDeploy
       SH
 
       step 'done.'
+    end
+
+    # -------- migrate (pre-0.3 layout) -------------------------------------
+
+    # Before 0.3 an app lived flat at <remote_base>/<domain>/ and its caddy
+    # file was <domain>.caddy. Deploying the new layout on top would leave two
+    # site files claiming the same domains, and caddy rejects that outright
+    # ("ambiguous site definition") - taking every site on the host with it.
+    # So `up` refuses until the old layout is gone.
+    def legacy_layout?(ctx)
+      return false if ctx.ssh.dry_run
+      ctx.ssh.run("[ -d #{Shellwords.escape(ctx.app_root)}/release ] && echo __LEGACY__ || true",
+                  as: :service, allow_fail: true).include?('__LEGACY__')
+    end
+
+    def check_legacy_layout!(ctx)
+      return unless legacy_layout?(ctx)
+      raise Error.new(
+        "pre-0.3 layout found at #{ctx.app_root}/release on #{ctx.host}.\n" \
+        "  0.3 deploys to #{ctx.app_dir}/ instead. Deploying now would leave two caddy site\n" \
+        "  files claiming #{ctx.app_domain}, which caddy rejects outright (ambiguous site\n" \
+        "  definition) - taking every site on the host down with it.\n" \
+        "  Move it first:  lux-deploy migrate"
+      )
+    end
+
+    # Convert the pre-0.3 layout in place: move the app's payload down into
+    # <domain>/<branch>/ and drop the old unit + caddy file. Ports, releases,
+    # .env and .env.local all come along, so the next `up` is an ordinary
+    # deploy rather than a rebuild.
+    def migrate(opts)
+      ctx = Context.build(opts)
+      step "migrate #{ctx.app_domain} to the branch layout on #{ctx.host}"
+
+      unless legacy_layout?(ctx) || ctx.ssh.dry_run
+        step "nothing to do - no #{ctx.app_root}/release (already migrated?)"
+        return
+      end
+
+      step "#{ctx.app_root}/  ->  #{ctx.app_dir}/"
+      step "unit #{legacy_units(ctx).first}  ->  #{ctx.services.first.unit}"
+      confirm_migrate!(ctx) unless opts[:yes] || ctx.ssh.dry_run
+
+      step 'stop + unlink the pre-0.3 unit and caddy site'
+      lines = legacy_units(ctx).flat_map do |unit|
+        ["systemctl disable --now #{unit} 2>/dev/null || true",
+         "rm -f #{SYSTEMD_DIR}/#{unit}.service"]
+      end
+      lines << 'systemctl daemon-reload'
+      lines << "rm -f #{CADDY_SITES}/#{ctx.app_domain}.caddy"
+      lines << 'systemctl reload caddy || true'
+      ctx.ssh.run(lines.join("\n"), allow_fail: true)
+
+      step 'move the app payload into the branch dir'
+      ctx.ssh.run(<<~SH, as: :service)
+        set -e
+        src=#{Shellwords.escape(ctx.app_root)}
+        dst=#{Shellwords.escape(ctx.app_dir)}
+        install -d "$dst"
+        for n in release old-release new-release shared log .env .env.local caddy.config #{Manifest::FILENAME}; do
+          [ -e "$src/$n" ] && mv "$src/$n" "$dst/$n" || true
+        done
+        for f in "$src"/*.service; do
+          [ -e "$f" ] || continue
+          mv "$f" "$dst/"
+        done
+        rm -f "$src/.deploy.lock"
+      SH
+
+      step "done. the site is down until you re-render it: lux-deploy up"
+    end
+
+    # Unit names the pre-0.3 layout installed. The old manifest is the record -
+    # it lists what was really wired up, including a service whose file has
+    # since been deleted locally. Falls back to deriving them from the checkout
+    # for an app that predates manifests.
+    def legacy_units(ctx)
+      installed = RemoteState.manifest_services(RemoteState.read_manifest(ctx, dir: ctx.app_root))
+      return installed.map(&:unit) unless installed.empty?
+
+      prefix = ctx.config.service_prefix
+      ctx.services.map { |s| s.web ? "#{prefix}-#{ctx.app_domain}" : "#{prefix}-#{ctx.app_domain}-#{s.name}" }
+    end
+
+    def confirm_migrate!(ctx)
+      $stderr.print "this stops #{ctx.app_domain} until the next deploy. type 'yes' to continue: "
+      raise Error.new('aborted; pass --yes to skip prompt') unless $stdin.gets.to_s.strip == 'yes'
     end
 
     # -------- rollback -----------------------------------------------------
@@ -486,7 +577,10 @@ module LuxDeploy
     def status(opts)
       ctx = Context.build(opts)
       man = RemoteState.read_manifest(ctx)
-      raise Error.new("no #{Manifest::FILENAME} in #{ctx.app_dir} on #{ctx.host} - deploy first") unless man
+      unless man
+        check_legacy_layout!(ctx)
+        raise Error.new("no #{Manifest::FILENAME} in #{ctx.app_dir} on #{ctx.host} - deploy first")
+      end
 
       step "status #{ctx.app} on #{ctx.host}"
       local = Manifest.capture('git rev-parse --short HEAD')
@@ -727,7 +821,7 @@ module LuxDeploy
           done
           [ -n "$up" ] || { echo "__DOWN__ $p"; exit 1; }
         done
-        #{http_probe_sh(ctx)}
+        #{http_probe_sh(ctx, ports)}
         echo __UP__
       SH
       return if out.include?('__UP__') || ctx.ssh.dry_run
@@ -740,9 +834,11 @@ module LuxDeploy
 
     # Optional HTTP probe on the web port, appended to the same remote script
     # so it shares the one round trip. Empty unless `health_path:` is set.
-    def http_probe_sh(ctx)
+    # `ports` is passed in rather than re-read: rollback and env:set have no
+    # ctx.ports, and reading the remote .env twice could disagree with itself.
+    def http_probe_sh(ctx, ports = ctx.ports.to_h)
       path = ctx.config.health_path
-      port = (ctx.ports || read_existing_ports(ctx))[:PORT]
+      port = ports[:PORT]
       return '' unless path && port
 
       <<~SH.chomp

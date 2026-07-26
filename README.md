@@ -266,6 +266,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | ---------------------- | ------- |
 | `lux-deploy up`        | deploy current branch |
 | `lux-deploy rollback`  | restore the previous release |
+| `lux-deploy migrate`   | move a pre-0.3 flat app dir into the `<domain>/<branch>` layout |
 | `lux-deploy status`    | what is live: commit, units, ports, rollback availability |
 | `lux-deploy redeploy`  | destroy + deploy (fresh PORTs) |
 | `lux-deploy destroy`   | stop this branch's services, unlink caddy/systemd, remove its dir |
@@ -507,26 +508,23 @@ git mv config/deploy/.env.staging config/deploy/.env.default
 
 `.env.default` no longer needs to build its own hostname - `DOMAIN={{DOMAIN}}` is already the branch host. Delete any `DOMAIN={{GIT_BRANCH}}.staging.{{DOMAIN}}` line.
 
-**2. Production moves one level down.** A `main` deploy that used to live at `<remote_base>/example.com/` now lives at `<remote_base>/example.com/main/`, and its unit renames from `web-example.com` to `web-example.com-main`.
-
-The next `up` builds the new location alongside the old one and leaves the old one serving - lux-deploy will not delete a live production directory on your behalf. Cut over when the new one looks right:
+**2. Production moves one level down** - run `lux-deploy migrate` once per app, from the branch that deploys it (usually `main`):
 
 ```sh
-lux-deploy up                              # creates apps/example.com/main, new unit, new caddy file
-lux-deploy status                          # confirm it is live and healthy
-lux-deploy caddy:doctor                    # both site files will be listed here
-
-# then, once, on the host:
-systemctl disable --now web-example.com
-rm -f /etc/systemd/system/web-example.com.service /etc/caddy/sites/example.com.caddy
-systemctl daemon-reload && systemctl reload caddy
-rm -rf <remote_base>/example.com/release <remote_base>/example.com/old-release \
-       <remote_base>/example.com/shared  <remote_base>/example.com/.env* \
-       <remote_base>/example.com/*.service <remote_base>/example.com/caddy.config \
-       <remote_base>/example.com/lux-deploy.yaml
+lux-deploy migrate   # moves apps/example.com/ -> apps/example.com/main/, drops the old unit + caddy file
+lux-deploy up        # re-renders the artifacts for the new paths and starts the new unit
+lux-deploy status    # confirm
 ```
 
-Both site files declare the same domains while they coexist, so reload caddy only after one of them is gone. Port allocation reads both layouts, so a pre-0.3 app keeps its ports reserved until you remove it.
+`migrate` moves the payload rather than rebuilding it, so allocated ports, `.env`, `.env.local`, `release/` and `old-release/` all survive. The site is down between the two commands - the rendered unit still points at the old paths until `up` re-renders it - so expect a few seconds, not a maintenance window.
+
+This is not optional. The pre-0.3 caddy file (`example.com.caddy`) and the new one (`example.com-main.caddy`) declare the same domains, and Caddy rejects that outright:
+
+```
+Error: adapting config using caddyfile: ambiguous site definition: example.com
+```
+
+Caddy validates before swapping, so nothing breaks - but the config is rejected as a whole, which would take every other site on the host with it. `up` therefore refuses to run while the old layout is present and points you here. Port allocation reads both layouts, so a not-yet-migrated app keeps its ports reserved in the meantime.
 
 **3. `prepare:nginx` is gone.** It installed nginx but no deploy could ever emit an nginx site file. See *Why Caddy, and only Caddy* above.
 

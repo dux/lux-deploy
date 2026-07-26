@@ -65,6 +65,15 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.redeploy(opts.merge(templates_dir: tdir)) } }
       end
 
+      target.task :migrate do
+        desc 'Move a pre-0.3 flat app dir into the <domain>/<branch> layout'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :yes,     type: :boolean, default: false, desc: 'Skip confirmation'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.migrate(opts.merge(templates_dir: tdir)) } }
+      end
+
       target.task :rollback do
         desc 'Restore the previous release (swap release <-> old-release)'
         opt :server,  desc: 'Override hostname from config/deploy/.yaml'

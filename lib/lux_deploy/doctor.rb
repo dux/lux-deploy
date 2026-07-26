@@ -164,7 +164,9 @@ module LuxDeploy
 
       # One env template per branch: .env.main serves master/main, .env.default
       # every other branch, .env.<branch> wins for one specific branch.
-      env_files = Dir.children(dir).select { |f| f.start_with?('.env') && f != '.env.local' }.sort
+      env_files = Dir.children(dir).sort.select do |f|
+        f.start_with?('.env') && f != '.env.local' && File.file?(File.join(dir, f))
+      end
       report.call(env_files.any?, "#{dir}/.env.* template present",
                   'expected at least .env.main or .env.default; run: lux-deploy app:init')
       report.call(File.exist?("#{dir}/caddy.conf"),      "#{dir}/caddy.conf present")

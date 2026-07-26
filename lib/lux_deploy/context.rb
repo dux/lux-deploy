@@ -172,6 +172,9 @@ module LuxDeploy
     def render_branch_domain
       Template.render(@config.branch_domain,
                       Template.git_vars.merge(APP_DOMAIN: @app_domain)).strip
+    rescue Error => e
+      raise Error.new("config/deploy/.yaml branch_domain: #{e.message.sub(/\AERROR: /, '')} " \
+                      '(available: GIT_BRANCH, GIT_BRANCH_UNDERSCORE, GIT_BRANCH_SLUG, APP_DOMAIN)')
     end
 
     # First hit wins: an exact per-branch file, then its slugged form, then
