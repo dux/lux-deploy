@@ -6,8 +6,9 @@ module LuxDeploy
   # `fix_cmd` is optional; if present and check fails, we run it (when --fix)
   # and re-check. Anything that needs interactive judgement leaves fix_cmd nil.
   module Doctor
-    GREEN ||= "\e[32m"
-    RED   ||= "\e[31m"
+    GREEN  ||= "\e[32m"
+    RED    ||= "\e[31m"
+    YELLOW ||= "\e[33m"
     DIM   ||= "\e[2m"
     RESET ||= "\e[0m"
 
@@ -15,18 +16,34 @@ module LuxDeploy
     # may reference these without declaring them in .env or .yaml.
     PROVIDED_VARS ||= %w[
       GIT_BRANCH GIT_BRANCH_UNDERSCORE APP APP_UNDERSCORE HASH TAG
-      PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME
+      PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME SERVICE_USER SERVICE_HOME
     ].freeze
 
     module_function
 
-    def run(ssh, config, fix: true)
+    def run(ssh, config, fix: true, dry_run: false)
       puts 'Local config'
       local_failed = local_checks(config)
       puts
 
-      puts 'Remote host'
       checks = build_checks(config)
+
+      # A dry run still does the local checks for real (they touch nothing) and
+      # prints the remote probes it would run, rather than reporting every
+      # remote check as failed because nothing was executed.
+      if dry_run
+        puts 'Remote host (dry run - not executed)'
+        checks.each do |label, check_cmd, fix_cmd|
+          puts "  #{DIM}CHECK#{RESET} #{label}"
+          puts "  #{DIM}        #{check_cmd.lines.first.chomp}#{RESET}"
+          puts "  #{DIM}        fix: #{fix_cmd.lines.first.chomp}#{RESET}" if fix && fix_cmd
+        end
+        puts
+        raise Error.new("doctor reported #{local_failed} local failure(s)") unless local_failed.zero?
+        return
+      end
+
+      puts 'Remote host'
       failed = local_failed
 
       checks.each do |label, check_cmd, fix_cmd|
@@ -82,6 +99,13 @@ module LuxDeploy
       File.exist?(f) && File.read(f).include?('.jsonl')
     end
 
+    # True when git ignores the path. Outside a git repo there is nothing to
+    # leak into, so treat it as fine rather than failing the check.
+    def gitignored?(path)
+      return true unless system('git', 'rev-parse', '--git-dir', out: File::NULL, err: File::NULL)
+      system('git', 'check-ignore', '-q', path, out: File::NULL, err: File::NULL)
+    end
+
     def local_checks(_config)
       dir = './config/deploy'
       failed = 0
@@ -97,6 +121,17 @@ module LuxDeploy
       }
 
       skip = ->(label) { puts "  #{DIM}SKIP  #{label} (does not exist)#{RESET}" }
+
+      # Advice, not a verdict - these are habits worth flagging but not
+      # reasons to block a deploy, so they never count toward `failed`.
+      nag = ->(ok, label, detail) {
+        if ok
+          puts "  #{GREEN}PASS#{RESET}  #{label}"
+        else
+          puts "  #{YELLOW}WARN#{RESET}  #{label}"
+          puts "  #{DIM}        #{detail}#{RESET}"
+        end
+      }
 
       unless Dir.exist?(dir)
         report.call(false, "#{dir}/ directory present",
@@ -128,6 +163,22 @@ module LuxDeploy
       report.call(File.exist?("#{dir}/.env"),            "#{dir}/.env present")
       report.call(File.exist?("#{dir}/caddy.conf"),      "#{dir}/caddy.conf present")
       report.call(File.exist?("#{dir}/systemd.service"), "#{dir}/systemd.service present")
+
+      # The .env template is rendered fresh on every deploy, so anything real
+      # in it is a secret living in the repo. Server-side values belong in
+      # <app_dir>/.env.local (see `lux-deploy env:set`).
+      if File.exist?("#{dir}/.env")
+        nag.call(!File.read("#{dir}/.env").include?('replace-me'),
+                 '.env has no leftover replace-me values',
+                 'set it on the server instead: lux-deploy env:set SECRET=$(openssl rand -hex 32)')
+        nag.call(gitignored?("#{dir}/.env"), "#{dir}/.env is gitignored",
+                 'it can hold secrets; add config/deploy/.env to .gitignore')
+      end
+
+      # A local .env.local does nothing - the overlay lives on the server, at
+      # <app_dir>/.env.local. Silently ignoring it would look like data loss.
+      nag.call(!File.exist?("#{dir}/.env.local"), "no stray #{dir}/.env.local",
+               'the env overlay lives on the server; use lux-deploy env:set / env:edit')
 
       # Lifecycle hooks - optional. Report each as PASS (present, will run)
       # or SKIP (absent, hook step will be skipped during `up`).

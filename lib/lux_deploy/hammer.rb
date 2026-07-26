@@ -51,6 +51,7 @@ module LuxDeploy
         desc 'Deploy current branch (rsync, hooks, swap, restart)'
         opt :server,  desc: 'Override hostname from config/deploy/.yaml'
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        opt :force,   type: :boolean, default: false, desc: 'Break an existing deploy lock'
 
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.up(opts.merge(templates_dir: tdir)) } }
       end
@@ -62,6 +63,15 @@ module LuxDeploy
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
 
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.redeploy(opts.merge(templates_dir: tdir)) } }
+      end
+
+      target.task :rollback do
+        desc 'Restore the previous release (swap release <-> old-release)'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :yes,     type: :boolean, default: false, desc: 'Skip confirmation'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.rollback(opts.merge(templates_dir: tdir)) } }
       end
 
       target.task :destroy do
@@ -76,7 +86,8 @@ module LuxDeploy
       target.task :doctor do
         desc 'Check & prepare host: service user, dirs, caddy, ruby, bundler'
         opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        opt :fix,    type: :boolean, default: true, desc: 'Auto-fix safe items (default true; --no-fix to skip)'
+        opt :fix,     type: :boolean, default: true, desc: 'Auto-fix safe items (default true; --no-fix to skip)'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print the remote checks, do not run them'
 
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.doctor(opts) } }
       end
@@ -89,7 +100,15 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.log(opts.merge(templates_dir: tdir)) } }
       end
 
+      target.task :status do
+        desc 'What is live: commit, units, ports, rollback availability'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.status(opts.merge(templates_dir: tdir)) } }
+      end
+
       target.namespace(:app)     { LuxDeploy::Hammer.define_app_on(self, tdir) }
+      target.namespace(:env)     { LuxDeploy::Hammer.define_env_on(self, tdir) }
+      target.namespace(:host)    { LuxDeploy::Hammer.define_host_on(self, tdir) }
       target.namespace(:server)  { LuxDeploy::Hammer.define_server_on(self, tdir) }
       target.namespace(:on)      { LuxDeploy::Hammer.define_on_hooks_on(self, tdir) }
       target.namespace(:prepare) { LuxDeploy::Hammer.define_prepare_on(self, tdir) }
@@ -138,6 +157,44 @@ module LuxDeploy
             LuxDeploy::Commands.hook(opts.merge(templates_dir: tdir), side, timing)
           }
         }
+      end
+    end
+
+    # `positional: false` on --server matters here: without it a bare
+    # `env:set FOO=bar` would bind FOO=bar to --server.
+    def define_env_on(target, tdir)
+      target.task :list do
+        desc 'Print the effective server env (secrets redacted)'
+        opt :server, positional: false, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.env_list(opts.merge(templates_dir: tdir)) } }
+      end
+
+      target.task :get do
+        desc 'Print one env value, unredacted (for scripting)'
+        opt :server, positional: false, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.env_get(opts.merge(templates_dir: tdir)) } }
+      end
+
+      target.task :set do
+        desc 'Set KEY=VALUE in the server-only .env.local, then restart'
+        opt :server,  positional: false, desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.env_set(opts.merge(templates_dir: tdir)) } }
+      end
+
+      target.task :edit do
+        desc 'Open the server-only .env.local in $EDITOR, then restart'
+        opt :server,  positional: false, desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.env_edit(opts.merge(templates_dir: tdir)) } }
+      end
+    end
+
+    def define_host_on(target, _tdir)
+      target.task :apps do
+        desc 'List every app deployed on the host, from their manifests'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.host_apps(opts) } }
       end
     end
 

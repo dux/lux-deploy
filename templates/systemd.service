@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=deployer
+User={{SERVICE_USER}}
 WorkingDirectory={{DIR}}/release
 # {{RUBY}} dir must be on PATH so `bundle` resolves under -S.
-Environment="PATH={{RUBY_DIR}}:/home/deployer/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH={{RUBY_DIR}}:{{SERVICE_HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Edit this line for your stack. Examples:
 #   ExecStart={{RUBY}} -S bundle exec puma -p {{PORT}} -e production
 #   ExecStart={{RUBY}} -S bundle exec rackup -p {{PORT}} -E production

@@ -2,6 +2,7 @@
 /vendor/bundle/
 /pkg/
 /tmp/
+/bin/bin/
 /coverage/
 /doc/
 *.gem

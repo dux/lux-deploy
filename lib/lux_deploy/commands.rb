@@ -12,6 +12,11 @@ module LuxDeploy
       run_local_before_hook(ctx)
 
       ensure_remote_dirs(ctx)
+
+      with_deploy_lock(ctx, force: opts[:force]) { deploy!(ctx, opts) }
+    end
+
+    def deploy!(ctx, opts)
       wipe_stale_new_release(ctx)
       ctx.ports ||= allocate_ports(ctx)
 
@@ -21,7 +26,8 @@ module LuxDeploy
       # starts with "!" at any depth - the disable convention (e.g.
       # !job.service, !scratch.rb never ship).
       ctx.ssh.rsync(ctx.config.src, "#{ctx.app_dir}/new-release/",
-                    excludes: %w[.git tmp log node_modules .DS_Store coverage !*])
+                    excludes: %w[.git tmp log node_modules .DS_Store coverage !*] +
+                              [RemoteState::SNAPSHOT_DIR])
 
       step 'symlink shared dirs into new-release'
       ctx.ssh.run(<<~SH, as: :service)
@@ -42,7 +48,10 @@ module LuxDeploy
 
       run_remote_before_hook(ctx)
 
-      step 'atomic release swap'
+      # Two mv calls, so there is a sub-second window with no release/ dir. A
+      # unit that crash-restarts inside it fails once and is picked up by the
+      # next Restart=always cycle.
+      step 'release swap'
       ctx.ssh.run(<<~SH, as: :service)
         cd #{Shellwords.escape(ctx.app_dir)} && \
         rm -rf old-release && \
@@ -58,7 +67,7 @@ module LuxDeploy
       step 'reload services'
       reload_services(ctx)
 
-      run_remote_after_hook(ctx)
+      run_remote_after_hook_or_rollback(ctx, opts)
 
       step "write #{Manifest::FILENAME}"
       upload_manifest(ctx)
@@ -71,7 +80,7 @@ module LuxDeploy
     # -------- lifecycle hook commands -------------------------------------
 
     def hook(opts, side, timing)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       check_renamed_hooks!
 
       case [side.to_sym, timing.to_sym]
@@ -86,17 +95,17 @@ module LuxDeploy
     # -------- destroy ------------------------------------------------------
 
     def destroy(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       step "destroy #{ctx.app} on #{ctx.host}"
       confirm_destroy!(ctx) unless opts[:yes]
 
-      step 'stop + disable systemd units'
-      lines = ctx.services.flat_map do |s|
-        ["systemctl disable --now #{s.unit} 2>/dev/null || true",
-         "rm -f #{SYSTEMD_DIR}/#{s.unit}.service"]
-      end
-      lines << 'systemctl daemon-reload'
-      ctx.ssh.run(lines.join("\n"), allow_fail: true)
+      # Units come from the remote manifest, not the local config/deploy scan -
+      # a *.service file deleted or "!"-disabled since the last deploy is still
+      # installed on the box, and tearing down only what the checkout knows
+      # about leaves it orphaned forever.
+      units = RemoteState.services(ctx)
+      step "stop + disable systemd units (#{units.map(&:unit).join(' ')})"
+      teardown_units(ctx, units)
 
       step 'unlink caddy site'
       ctx.ssh.run(<<~SH, allow_fail: true)
@@ -108,6 +117,105 @@ module LuxDeploy
       ctx.ssh.run("rm -rf #{Shellwords.escape(ctx.app_dir)}", as: :service, allow_fail: true)
 
       step 'done.'
+    end
+
+    # -------- rollback -----------------------------------------------------
+
+    # Put the previous release back. `up` keeps exactly one (old-release/), so
+    # rollback depth is one - but the swap is symmetric, so running it twice
+    # returns you to where you started.
+    #
+    # `from_services:` overrides what we consider currently installed. `up`
+    # passes it on the on_fail path, because there the manifest on the box is
+    # still the *previous* deploy's - it is only written after remote_after.sh
+    # succeeds - so a unit this deploy introduced would otherwise be left
+    # running against rolled-back code.
+    def rollback(opts, from_services: nil)
+      ctx = Context.build(opts)
+      step "rollback #{ctx.app} on #{ctx.host}"
+
+      dir  = Shellwords.escape(ctx.app_dir)
+      have = ctx.ssh.run("[ -d #{dir}/old-release ] && echo __YES__ || true",
+                         as: :service, allow_fail: true)
+      unless ctx.ssh.dry_run || have.include?('__YES__')
+        raise Error.new("nothing to roll back to: #{ctx.app_dir}/old-release does not exist on #{ctx.host}")
+      end
+
+      snapshot = "#{ctx.app_dir}/old-release/#{RemoteState::SNAPSHOT_DIR}"
+      from     = RemoteState.read_manifest(ctx)
+      to       = RemoteState.read_manifest(ctx, dir: snapshot)
+
+      step "from #{RemoteState.commit(from)}"
+      step "to   #{RemoteState.commit(to)}"
+      confirm_rollback!(ctx) unless opts[:yes] || ctx.ssh.dry_run
+
+      # `release` may be absent - a deploy killed inside the two-mv swap window
+      # leaves exactly that state, and it is the case rollback most needs to
+      # repair, so the swap must not require it.
+      step 'swap release <-> old-release'
+      ctx.ssh.run(<<~SH, as: :service)
+        set -e
+        cd #{dir}
+        rm -rf rollback-tmp
+        if [ -d release ]; then mv release rollback-tmp; fi
+        mv old-release release
+        if [ -d rollback-tmp ]; then mv rollback-tmp old-release; fi
+      SH
+
+      step 'restore rendered artifacts from the release snapshot'
+      restore_artifacts(ctx)
+
+      # Units come from the restored release's own manifest, not the local
+      # checkout - a service file added since that release must not be
+      # restarted, and one dropped since then must not be forgotten.
+      old_units = from_services || RemoteState.manifest_services(from)
+      new_units = RemoteState.services(ctx, to)
+      stale     = stale_units(old_units, new_units)
+
+      step "stop units the restored release does not have (#{stale.map(&:unit).join(' ')})" unless stale.empty?
+      teardown_units(ctx, stale)
+
+      step 'install systemd + caddy symlinks'
+      install_system_symlinks(ctx, new_units)
+
+      step 'reload services'
+      reload_services(ctx, new_units)
+
+      step "done. rolled back to #{RemoteState.commit(to)} - https://#{ctx.domain}"
+    end
+
+    # Copy <release>/.lux-deploy/* back over <app_dir>/. Tolerates a missing
+    # snapshot (a release deployed before snapshots existed): the app_dir
+    # artifacts are then left as they are and only the code was rolled back.
+    def restore_artifacts(ctx)
+      dir = Shellwords.escape(ctx.app_dir)
+      ctx.ssh.run(<<~SH, as: :service)
+        set -e
+        snap=#{dir}/release/#{RemoteState::SNAPSHOT_DIR}
+        if [ ! -d "$snap" ]; then
+          echo "no #{RemoteState::SNAPSHOT_DIR}/ in the restored release - keeping current .env / units / caddy.config"
+          exit 0
+        fi
+        for f in "$snap"/* "$snap"/.[!.]*; do
+          [ -f "$f" ] || continue
+          cp -f "$f" #{dir}/
+          chmod 0644 #{dir}/"$(basename "$f")"
+        done
+        chmod 0600 #{dir}/.env 2>/dev/null || true
+      SH
+    end
+
+    # Units that were installed but the restored release does not have. Left
+    # alone they keep running against code that is no longer there.
+    def stale_units(installed, restored)
+      names = restored.map(&:unit)
+      installed.reject { |s| names.include?(s.unit) }
+    end
+
+    def confirm_rollback!(ctx)
+      $stderr.print "roll back #{ctx.app} on #{ctx.host}? type 'yes' to confirm: "
+      typed = $stdin.gets.to_s.strip
+      raise Error.new('aborted; pass --yes to skip prompt') unless typed == 'yes'
     end
 
     # -------- redeploy ----------------------------------------------------
@@ -123,7 +231,7 @@ module LuxDeploy
       host = Context.read_host(opts)
       config = Config.load
       ssh = SSH.new(host, service_user: config.service_user, dry_run: false)
-      Doctor.run(ssh, config, fix: opts.fetch(:fix, true))
+      Doctor.run(ssh, config, fix: opts.fetch(:fix, true), dry_run: opts[:dry_run] || false)
     end
 
     # -------- prepare:caddy / prepare:nginx -------------------------------
@@ -178,9 +286,9 @@ module LuxDeploy
     # Per-app inspection: host-wide importer unit status + this app's log dir
     # listing + SQLite stats (row count, ts span, checkpoint).
     def caddy_log_status(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       dir = "#{ctx.app_dir}/log"
-      bun = "/home/#{ctx.config.service_user}/.bun/bin/bun"
+      bun = "#{ctx.service_home}/.bun/bin/bun"
       step "caddy log status for #{ctx.app}"
       ctx.ssh.stream("systemctl status #{IMPORTER_UNIT} --no-pager", allow_fail: true)
       ctx.ssh.stream("ls -lh #{Shellwords.escape(dir)}/ 2>/dev/null || true", as: :service, allow_fail: true)
@@ -227,10 +335,160 @@ module LuxDeploy
       $stderr.puts "done. edit #{dest_dir}/.env (SECRET, DOMAIN) and #{dest_dir}/.yaml, then run 'lux-deploy doctor' and 'lux-deploy up'"
     end
 
+    # -------- env:* --------------------------------------------------------
+
+    # Server-side env overlay. <app_dir>/.env is rendered from the repo
+    # template on every deploy, so anything set on the box used to vanish on
+    # the next `up`; .env.local is the file that survives. These commands are
+    # sugar over editing it - `server:ssh` and $EDITOR does the same thing.
+    ENV_LOCAL ||= '.env.local'
+
+    def env_list(opts)
+      ctx = Context.build(opts)
+      env = Template.parse_env(read_remote_file(ctx, "#{ctx.app_dir}/.env"))
+      raise Error.new("no #{ctx.app_dir}/.env on #{ctx.host} - deploy first") if env.empty?
+
+      overlay = Template.parse_env_raw(read_remote_file(ctx, "#{ctx.app_dir}/#{ENV_LOCAL}")).keys
+      step "env for #{ctx.app} on #{ctx.host} (secrets redacted; * = set in #{ENV_LOCAL})"
+      width = env.keys.map { |k| k.to_s.length }.max
+      env.each do |k, v|
+        value = Manifest.sensitive?(k) || Manifest.sensitive_value?(v) ? '<redacted>' : v
+        puts format("  %-<key>#{width}s  %<mark>s %<value>s",
+                    key: k, mark: overlay.include?(k.to_s) ? '*' : ' ', value: value)
+      end
+    end
+
+    # Unredacted single value - this one is for scripting, so it prints the
+    # bare value on stdout and nothing else.
+    def env_get(opts)
+      key = Array(opts[:args]).first.to_s.strip
+      raise Error.new('usage: lux-deploy env:get KEY') if key.empty?
+      ctx = Context.build(opts)
+      env = Template.parse_env(read_remote_file(ctx, "#{ctx.app_dir}/.env"))
+      raise Error.new("#{key} is not set") unless env.key?(key.to_sym)
+      puts env[key.to_sym]
+    end
+
+    def env_set(opts)
+      pairs = Array(opts[:args]).map { |a| a.to_s.split('=', 2) }
+      raise Error.new('usage: lux-deploy env:set KEY=VALUE [KEY2=VALUE2]') if pairs.empty?
+      bad = pairs.reject { |k, v| v && k.to_s.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/) }
+      raise Error.new("not KEY=VALUE: #{bad.map(&:first).join(' ')}") unless bad.empty?
+
+      ctx = Context.build(opts)
+      step "set #{pairs.map(&:first).join(' ')} in #{ctx.app_dir}/#{ENV_LOCAL}"
+      write_env_overlay(ctx, merge_env(read_remote_file(ctx, "#{ctx.app_dir}/#{ENV_LOCAL}"), pairs.to_h))
+    end
+
+    def env_edit(opts)
+      ctx    = Context.build(opts)
+      editor = ENV['EDITOR'] || ENV['VISUAL'] || 'vi'
+      remote = "#{ctx.app_dir}/#{ENV_LOCAL}"
+      step "edit #{remote} with #{editor}"
+      return if ctx.ssh.dry_run
+
+      require 'tempfile'
+      Tempfile.create(['lux-deploy-env', '.env']) do |f|
+        f.write(read_remote_file(ctx, remote))
+        f.flush
+        before = File.read(f.path)
+        # Single-string form so an EDITOR carrying flags ("code --wait") works.
+        system("#{editor} #{Shellwords.escape(f.path)}") or
+          raise Error.new("#{editor} exited non-zero; nothing changed")
+        after = File.read(f.path)
+        next step('unchanged') if before == after
+        write_env_overlay(ctx, after)
+      end
+    end
+
+    # Write the overlay and fold it straight into the live <app_dir>/.env, so
+    # the change takes effect on restart instead of waiting for a deploy.
+    # The next `up` re-renders and re-applies the same overlay.
+    def write_env_overlay(ctx, body)
+      write_remote_file(ctx, "#{ctx.app_dir}/#{ENV_LOCAL}", body, mode: '0600')
+
+      live = read_remote_file(ctx, "#{ctx.app_dir}/.env")
+      if live.strip.empty?
+        step 'no live .env yet - the overlay applies on the next deploy'
+        return
+      end
+      write_remote_file(ctx, "#{ctx.app_dir}/.env", merge_env(live, read_env_overlay(ctx)), mode: '0600')
+
+      step 'restart services'
+      reload_services(ctx, RemoteState.services(ctx))
+    end
+
+    # -------- status / host:apps -------------------------------------------
+
+    # What is actually live, read from the manifest the last deploy wrote plus
+    # a look at systemd and the listening sockets.
+    def status(opts)
+      ctx = Context.build(opts)
+      man = RemoteState.read_manifest(ctx)
+      raise Error.new("no #{Manifest::FILENAME} in #{ctx.app_dir} on #{ctx.host} - deploy first") unless man
+
+      step "status #{ctx.app} on #{ctx.host}"
+      local = Manifest.capture('git rev-parse --short HEAD')
+      live  = man.dig('git', 'commit_short')
+      puts "  commit      #{RemoteState.commit(man)}#{live && local && live != local ? "  (local HEAD is #{local})" : ''}"
+      puts "  branch      #{man.dig('git', 'branch')}"
+      puts "  deployed    #{man['deployed_at']} by #{man.dig('deploy', 'triggered_by')}"
+      puts "  url         #{man['url']}"
+
+      units = RemoteState.services(ctx, man)
+      active = ctx.ssh.run(units.map { |s| "echo \"#{s.unit} $(systemctl is-active #{s.unit} 2>/dev/null)\"" }.join("\n"),
+                           allow_fail: true)
+      puts '  services'
+      active.lines.map(&:strip).reject(&:empty?).each { |l| puts "    #{l}" }
+
+      ports = (man.dig('deploy', 'ports') || {})
+      unless ports.empty?
+        listening = scan_listening_ports(ctx)
+        puts '  ports'
+        ports.each { |k, v| puts "    #{k}=#{v} #{listening.include?(v.to_i) ? 'listening' : 'NOT listening'}" }
+      end
+
+      has_old = ctx.ssh.run("[ -d #{Shellwords.escape(ctx.app_dir)}/old-release ] && echo yes || echo no",
+                            as: :service, allow_fail: true)
+      puts "  rollback    #{has_old.include?('yes') ? 'available (lux-deploy rollback)' : 'unavailable'}"
+    end
+
+    # Every app on the host, straight from the manifests. One ssh round trip.
+    def host_apps(opts)
+      config = Config.load
+      ssh    = prepare_ssh(opts)
+      step "apps in #{config.remote_base} on #{ssh.host}"
+
+      raw = ssh.run(<<~SH, allow_fail: true)
+        for f in #{Shellwords.escape(config.remote_base)}/*/#{Manifest::FILENAME}; do
+          [ -f "$f" ] || continue
+          echo "__APP__ $f"
+          cat "$f"
+        done
+      SH
+
+      rows = raw.split('__APP__ ').drop(1).filter_map do |chunk|
+        man = RemoteState.parse(chunk.split("\n", 2).last)
+        next unless man
+        [man['app'].to_s,
+         man.dig('git', 'branch').to_s,
+         RemoteState.commit(man),
+         (man.dig('deploy', 'ports') || {}).values.join(','),
+         man['deployed_at'].to_s]
+      end
+
+      return puts('  (none)') if rows.empty?
+      head  = %w[APP BRANCH COMMIT PORTS DEPLOYED]
+      width = head.each_index.map { |i| ([head[i]] + rows.map { |r| r[i] }).map(&:length).max }
+      [head, *rows.sort_by(&:first)].each do |r|
+        puts '  ' + r.each_with_index.map { |c, i| c.ljust(width[i]) }.join('  ').rstrip
+      end
+    end
+
     # -------- server:ssh --------------------------------------------------
 
     def server_ssh(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       step "ssh #{ctx.app_dir}/release (#{ctx.config.service_user})"
       ctx.ssh.exec(
         "cd #{Shellwords.escape(ctx.app_dir)}/release && exec bash -li",
@@ -241,7 +499,7 @@ module LuxDeploy
     # -------- server:log --------------------------------------------------
 
     def server_log(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       unit = web_unit(ctx)
       step "journalctl -fu #{unit}"
       ctx.ssh.exec("journalctl -u #{unit} -n 200 -f")
@@ -252,7 +510,7 @@ module LuxDeploy
     # `lux-deploy log` lists the shared release/log dir; `--log <name>` dumps the
     # last `--lines` (200) lines of that file (the `.log` suffix is optional).
     def log(opts)
-      ctx     = Context.build(opts, render: false)
+      ctx     = Context.build(opts)
       log_dir = "#{ctx.app_dir}/release/log"
 
       if (name = opts[:log])
@@ -270,7 +528,7 @@ module LuxDeploy
     # -------- server:restart ----------------------------------------------
 
     def server_restart(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       unit = web_unit(ctx)
       step "restart #{unit}"
       ctx.ssh.run("systemctl restart #{unit}")
@@ -279,7 +537,7 @@ module LuxDeploy
     # -------- server:status -----------------------------------------------
 
     def server_status(opts)
-      ctx = Context.build(opts, render: false)
+      ctx = Context.build(opts)
       unit = web_unit(ctx)
       step "status #{unit}"
       ctx.ssh.stream("systemctl status #{unit} --no-pager", allow_fail: true)
@@ -288,7 +546,7 @@ module LuxDeploy
     # -------- server:errors -----------------------------------------------
 
     def server_errors(opts)
-      ctx  = Context.build(opts, render: false)
+      ctx  = Context.build(opts)
       path = "#{ctx.app_dir}/release/log/error.log"
       step "tail -f #{path}"
       ctx.ssh.exec("tail -f #{Shellwords.escape(path)}", as: :service)
@@ -331,6 +589,60 @@ module LuxDeploy
       "#{body} #{Shellwords.escape(path)}"
     end
 
+    # -------- deploy lock --------------------------------------------------
+
+    # Two deploys of the same app at once interleave the rsync and the swap and
+    # produce a release that is neither. flock can't span separate ssh
+    # invocations, so the lock is a file: created with noclobber (O_EXCL, so the
+    # create is atomic) and removed on the way out.
+    LOCK_FILE  ||= '.deploy.lock'
+    LOCK_STALE ||= 60 # minutes; older than this and the holder is presumed dead
+
+    def with_deploy_lock(ctx, force: false)
+      acquire_deploy_lock(ctx, force: force)
+      begin
+        yield
+      ensure
+        release_deploy_lock(ctx)
+      end
+    end
+
+    def acquire_deploy_lock(ctx, force: false)
+      step "take deploy lock (#{ctx.app_dir}/#{LOCK_FILE})"
+      path = "#{Shellwords.escape(ctx.app_dir)}/#{LOCK_FILE}"
+      info = "pid=#{Process.pid} by=#{Manifest.triggered_by} at=#{Time.now.utc.iso8601}"
+
+      # noclobber lives in a subshell: its "cannot overwrite existing file" is
+      # emitted while setting up the redirection, before the `2>/dev/null` in
+      # the same list takes effect, so it has to be silenced from outside.
+      out = ctx.ssh.run(<<~SH, as: :service, allow_fail: true)
+        if ( set -C; echo #{Shellwords.escape(info)} > #{path} ) 2>/dev/null; then
+          echo __ACQUIRED__
+          exit 0
+        fi
+        held=$(cat #{path} 2>/dev/null)
+        if [ -n "#{force ? '1' : ''}" ] || [ -z "$(find #{path} -mmin -#{LOCK_STALE} 2>/dev/null)" ]; then
+          echo "__BROKEN__ $held"
+          echo #{Shellwords.escape(info)} > #{path}
+          exit 0
+        fi
+        echo "__HELD__ $held"
+      SH
+
+      if out.include?('__HELD__')
+        held = out[/__HELD__ (.*)/, 1].to_s.strip
+        raise Error.new("deploy already running for #{ctx.app} on #{ctx.host} (#{held}).\n" \
+                        "  Wait for it, or pass --force to break the lock " \
+                        "(it expires on its own after #{LOCK_STALE} minutes).")
+      end
+      warn "  broke stale deploy lock (#{out[/__BROKEN__ (.*)/, 1].to_s.strip})" if out.include?('__BROKEN__')
+    end
+
+    def release_deploy_lock(ctx)
+      step 'release deploy lock'
+      ctx.ssh.run("rm -f #{Shellwords.escape(ctx.app_dir)}/#{LOCK_FILE}", as: :service, allow_fail: true)
+    end
+
     # Remove any new-release/ left behind by a prior failed deploy.
     # Runs at the start of `up` so a fresh rsync doesn't merge with
     # stale gem builds / half-installed assets.
@@ -346,9 +658,9 @@ module LuxDeploy
     # Enable + restart every discovered service, then reload caddy once.
     # daemon-reload first so changed unit files are picked up. set -e aborts
     # (and run raises) on the first failure.
-    def reload_services(ctx)
+    def reload_services(ctx, services = ctx.services)
       lines = ['set -e', 'systemctl daemon-reload']
-      ctx.services.each do |s|
+      services.each do |s|
         lines << "systemctl enable --now #{s.unit}"
         lines << "systemctl restart #{s.unit}"
       end
@@ -398,7 +710,7 @@ module LuxDeploy
 
       to_assign = needed - reused
       unless to_assign.empty?
-        in_use = scan_listening_ports(ctx) | existing.values.to_set
+        in_use = scan_listening_ports(ctx) | claimed_ports(ctx) | existing.values.to_set
         to_assign.each do |k|
           free = PORT_RANGE.find { |p| !in_use.include?(p) }
           raise Error.new("no free port in 3010..3990 (step 10) for #{k}") unless free
@@ -448,6 +760,17 @@ module LuxDeploy
         .lines.map { |l| l.strip.to_i }.to_set
     end
 
+    # Ports claimed by every app on the host, listening or not. `ss` alone only
+    # sees bound sockets, so an app that is deployed but stopped (crashed,
+    # mid-deploy, between destroy and up) would have its port handed to the
+    # next app. The .env files stay the record - no ledger to keep in sync.
+    def claimed_ports(ctx)
+      # remote_base is escaped but the glob is not - it has to expand remotely.
+      ctx.ssh.run("grep -hE '^PORT[A-Z0-9_]*=' #{Shellwords.escape(ctx.config.remote_base)}/*/.env 2>/dev/null || true",
+                  as: :service, allow_fail: true)
+        .lines.filter_map { |l| l.strip =~ /^PORT[A-Z0-9_]*=(\d+)/ ? $1.to_i : nil }.to_set
+    end
+
     # Install whatever the app pins in mise.toml (ruby, node, ...) before the
     # render probes for ruby. Runs in new-release/ so mise reads the app's own
     # pin - no version parsing here. Gated on the file existing, so non-mise
@@ -475,10 +798,15 @@ module LuxDeploy
     def render_artifacts(ctx)
       step 'render templates'
 
+      # SERVICE_USER / SERVICE_HOME are engine-derived rather than yaml
+      # placeholders (service_user is behavioral), but units need them or a
+      # non-default service_user silently deploys a unit running as deployer.
       vars = ctx.base_vars.merge(ctx.ports).merge(
-        DIR:      ctx.app_dir,
-        LOG_DIR:  "#{ctx.app_dir}/log",
-        LOG_NAME: ctx.app
+        DIR:          ctx.app_dir,
+        LOG_DIR:      "#{ctx.app_dir}/log",
+        LOG_NAME:     ctx.app,
+        SERVICE_USER: ctx.config.service_user,
+        SERVICE_HOME: ctx.service_home
       )
       # RUBY/RUBY_DIR (and the ssh ruby probe) only when a template asks for
       # them - a Go/Python unit running a built binary never triggers it.
@@ -486,10 +814,14 @@ module LuxDeploy
         vars = vars.merge(RUBY: ctx.ruby_path, RUBY_DIR: File.dirname(ctx.ruby_path))
       end
 
-      # Persist every allocated PORT* into .env so allocate_ports reuses the
-      # same ports on the next deploy. Without this they only land in
-      # systemd/caddy, the reuse path never fires, and ports drift.
-      env_body = persist_ports(Template.render(ctx.read_template(ctx.env_template_name), vars), ctx.ports)
+      # .env.local (server-only, set by `env:set`) layers over the rendered
+      # template, then PORT* over that - ports are engine-owned, so a pinned
+      # PORT in the overlay would just desync caddy from the unit.
+      # Persisting the ports into .env is also what makes allocate_ports
+      # reuse them next deploy instead of drifting.
+      env_body = Template.render(ctx.read_template(ctx.env_template_name), vars)
+      env_body = merge_env(env_body, read_env_overlay(ctx))
+      env_body = merge_env(env_body, ctx.ports)
 
       rendered = {
         '.env'         => env_body,
@@ -501,13 +833,13 @@ module LuxDeploy
       ctx.rendered = rendered
     end
 
-    # Ensure every managed PORT* key appears with its value in the rendered
-    # .env body: replace an existing `KEY=` line or append one. The `=` anchor
-    # keeps PORT= from clobbering PORT_FOO=.
-    def persist_ports(env_body, ports)
-      ports.each do |key, val|
-        if env_body =~ /^#{key}=.*$/
-          env_body = env_body.sub(/^#{key}=.*$/, "#{key}=#{val}")
+    # Merge KEY=value pairs into a .env body: replace an existing `KEY=` line
+    # or append one. The `=` anchor keeps PORT= from clobbering PORT_FOO=.
+    def merge_env(env_body, pairs)
+      pairs.each do |key, val|
+        re = /^#{Regexp.escape(key.to_s)}=.*$/
+        if env_body.match?(re)
+          env_body = env_body.sub(re, "#{key}=#{val}")
         else
           env_body += "\n" unless env_body.empty? || env_body.end_with?("\n")
           env_body += "#{key}=#{val}\n"
@@ -516,29 +848,71 @@ module LuxDeploy
       env_body
     end
 
+    # Operator-set env that lives only on the server, merged over the rendered
+    # .env on every deploy - so `env:set` survives a redeploy. The repo
+    # template keeps the shape of the env; the box holds the values.
+    def read_env_overlay(ctx)
+      pairs   = Template.parse_env_raw(read_remote_file(ctx, "#{ctx.app_dir}/#{ENV_LOCAL}"))
+      managed = pairs.keys.grep(/\APORT[A-Z0-9_]*\z/)
+      unless managed.empty?
+        warn "  #{ENV_LOCAL}: ignoring #{managed.join(' ')} - PORT* are engine-allocated"
+        managed.each { |k| pairs.delete(k) }
+      end
+      pairs
+    end
+
+    def read_remote_file(ctx, path)
+      ctx.ssh.run("cat #{Shellwords.escape(path)} 2>/dev/null || true", as: :service, allow_fail: true)
+    end
+
     # Upload rendered files atomically (write to .new, mv).
     # .env is 0600 (secrets); other artifacts are 0644 so caddy/systemd
     # (running as their own users) can read the symlinks into ctx.app_dir.
+    #
+    # Each artifact is also copied into new-release/.lux-deploy/ so it travels
+    # with the code through the swap. Ports are stable across deploys, but
+    # ExecStart and the caddy config are not - rolling code back without its
+    # unit file gives a mismatched release.
     def upload_artifacts(ctx)
+      snapshot = "#{ctx.app_dir}/new-release/#{RemoteState::SNAPSHOT_DIR}"
       ctx.rendered.each do |name, body|
-        remote_path = "#{ctx.app_dir}/#{name}"
-        b64 = [body].pack('m0')
-        mode = name == '.env' ? '0600' : '0644'
-        ctx.ssh.run(<<~SH, as: :service)
-          install -d #{Shellwords.escape(File.dirname(remote_path))}
-          echo #{Shellwords.escape(b64)} | base64 -d > #{Shellwords.escape(remote_path)}.new
-          mv #{Shellwords.escape(remote_path)}.new #{Shellwords.escape(remote_path)}
-          chmod #{mode} #{Shellwords.escape(remote_path)}
-        SH
+        write_remote_file(ctx, "#{ctx.app_dir}/#{name}", body, mode: artifact_mode(name))
+        write_remote_file(ctx, "#{snapshot}/#{name}", body, mode: artifact_mode(name))
       end
+    end
+
+    def artifact_mode(name) = name == '.env' ? '0600' : '0644'
+
+    # Atomic remote write as the service user: base64 in, .new, mv, chmod.
+    def write_remote_file(ctx, remote_path, body, mode: '0644')
+      b64 = [body].pack('m0')
+      ctx.ssh.run(<<~SH, as: :service)
+        install -d #{Shellwords.escape(File.dirname(remote_path))}
+        echo #{Shellwords.escape(b64)} | base64 -d > #{Shellwords.escape(remote_path)}.new
+        mv #{Shellwords.escape(remote_path)}.new #{Shellwords.escape(remote_path)}
+        chmod #{mode} #{Shellwords.escape(remote_path)}
+      SH
     end
 
     # Strict mode is enforced by the engine, not by each hook script, so the
     # templates don't have to repeat `set -euo pipefail`. Sourcing (not `bash
     # <file>`) is what makes the flags apply inside the hook - a child `bash
     # <file>` would not inherit them.
-    def run_local_hook(path)
-      system('bash', '-c', "set -euo pipefail\nsource #{Shellwords.escape(path)}")
+    def run_local_hook(path, ctx)
+      system(local_hook_env(ctx), 'bash', '-c', "set -euo pipefail\nsource #{Shellwords.escape(path)}")
+    end
+
+    # Local hooks get the deploy context in their environment so a notification
+    # or cleanup script doesn't have to re-parse config/deploy/.yaml.
+    def local_hook_env(ctx)
+      {
+        'LUX_DEPLOY_APP'    => ctx.app,
+        'LUX_DEPLOY_DOMAIN' => ctx.domain,
+        'LUX_DEPLOY_HOST'   => ctx.host,
+        'LUX_DEPLOY_BRANCH' => ctx.branch.to_s,
+        'LUX_DEPLOY_DIR'    => ctx.app_dir,
+        'LUX_DEPLOY_PORT'   => ctx.port.to_s
+      }
     end
 
     LOCAL_BEFORE_HOOK  ||= 'config/deploy/local_before.sh'
@@ -576,7 +950,7 @@ module LuxDeploy
         $stderr.puts "  [dry] bash #{LOCAL_BEFORE_HOOK}"
         return
       end
-      run_local_hook(LOCAL_BEFORE_HOOK) or
+      run_local_hook(LOCAL_BEFORE_HOOK, ctx) or
         raise Error.new("#{LOCAL_BEFORE_HOOK} failed; deploy aborted (no remote state changed)")
     end
 
@@ -639,6 +1013,20 @@ module LuxDeploy
       )
     end
 
+    # `on_fail: rollback` closes the loop the engine deliberately leaves open:
+    # remote_after.sh is the app's own verification, and if it says the release
+    # is bad we put the previous one back. Default stays `keep` - the release
+    # is live and the operator decides.
+    def run_remote_after_hook_or_rollback(ctx, opts)
+      run_remote_after_hook(ctx)
+    rescue Error => e
+      raise unless ctx.config.rollback_on_fail?
+      warn e.to_s
+      step 'on_fail: rollback - restoring the previous release'
+      rollback(opts.merge(yes: true), from_services: ctx.services)
+      raise Error.new("#{REMOTE_AFTER_HOOK} failed; rolled back to the previous release")
+    end
+
     # Post-deploy local hook. Runs in the project root after the remote deploy
     # succeeded and the manifest is written - notifications, cleanup of local
     # build artifacts produced by local_before. Optional - announced as "(not
@@ -653,32 +1041,40 @@ module LuxDeploy
         $stderr.puts "  [dry] bash #{LOCAL_AFTER_HOOK}"
         return
       end
-      return if run_local_hook(LOCAL_AFTER_HOOK)
+      return if run_local_hook(LOCAL_AFTER_HOOK, ctx)
       msg = "#{LOCAL_AFTER_HOOK} failed"
       strict ? raise(Error.new(msg)) : warn("#{msg} but deploy is already live; continuing")
     end
 
     # Build + upload the post-deploy snapshot to <app_dir>/lux-deploy.yaml.
-    # Same atomic write pattern as upload_artifacts. 0644 so any user on
-    # the box can read it (it never contains secrets).
+    # 0644 so any user on the box can read it (it never contains secrets).
+    # A copy lands in release/.lux-deploy/ too, so `rollback` can report which
+    # commit it is restoring.
     def upload_manifest(ctx)
       body = Manifest.render(ctx)
-      remote = "#{ctx.app_dir}/#{Manifest::FILENAME}"
-      b64 = [body].pack('m0')
-      ctx.ssh.run(<<~SH, as: :service)
-        echo #{Shellwords.escape(b64)} | base64 -d > #{Shellwords.escape(remote)}.new
-        mv #{Shellwords.escape(remote)}.new #{Shellwords.escape(remote)}
-        chmod 0644 #{Shellwords.escape(remote)}
-      SH
+      write_remote_file(ctx, "#{ctx.app_dir}/#{Manifest::FILENAME}", body)
+      write_remote_file(ctx, "#{ctx.app_dir}/release/#{RemoteState::SNAPSHOT_DIR}/#{Manifest::FILENAME}", body)
     end
 
-    def install_system_symlinks(ctx)
+    def install_system_symlinks(ctx, services = ctx.services)
       lines = ["install -d #{CADDY_SITES} #{SYSTEMD_DIR}"]
-      ctx.services.each do |s|
+      services.each do |s|
         lines << "ln -sfn #{Shellwords.escape(ctx.app_dir)}/#{s.artifact} #{SYSTEMD_DIR}/#{s.unit}.service"
       end
       lines << "ln -sfn #{Shellwords.escape(ctx.app_dir)}/caddy.config #{CADDY_SITES}/#{ctx.app}.caddy"
       ctx.ssh.run(lines.join("\n"))
+    end
+
+    # Stop, disable and unlink units. Used by destroy (everything) and by
+    # rollback (only units the restored release no longer has).
+    def teardown_units(ctx, services)
+      return if services.empty?
+      lines = services.flat_map do |s|
+        ["systemctl disable --now #{s.unit} 2>/dev/null || true",
+         "rm -f #{SYSTEMD_DIR}/#{s.unit}.service"]
+      end
+      lines << 'systemctl daemon-reload'
+      ctx.ssh.run(lines.join("\n"), allow_fail: true)
     end
   end
 end

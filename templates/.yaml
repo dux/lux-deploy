@@ -13,4 +13,5 @@ domain: example.com
 # service_user:       deployer
 # remote_base:        /home/deployer/apps
 # service_prefix:     web                     # systemd unit: <prefix>-<app>.service
-# job_service_prefix:                         # nil disables job.service
+# src:                ./                      # local dir rsync ships (config/deploy/src wins)
+# on_fail:            keep                    # keep | rollback, when remote_after.sh fails

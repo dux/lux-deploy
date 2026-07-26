@@ -83,7 +83,6 @@ module LuxDeploy
     # Upload the bundled importer script to a host path (root-owned, world-
     # readable so the service user can run it). Atomic write (.new + mv).
     def install_importer(ssh, importer_local, importer_remote)
-      return if ssh.dry_run
       b64 = [File.read(importer_local)].pack('m0')
       ssh.run(<<~SH)
         install -d -m 0755 #{File.dirname(importer_remote)}
@@ -114,7 +113,6 @@ module LuxDeploy
         [Install]
         WantedBy=multi-user.target
       UNIT
-      return if ssh.dry_run
       b64  = [body].pack('m0')
       unit = "#{SYSTEMD_DIR}/#{IMPORTER_UNIT}.service"
       ssh.run(<<~SH)

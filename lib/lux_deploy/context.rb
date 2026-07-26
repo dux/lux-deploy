@@ -19,6 +19,10 @@ module LuxDeploy
       @ruby_path ||= detect_ruby_path
     end
 
+    # Service user's home. Every remote step runs via `sudo -iu <user>`, so
+    # this is where mise/bun land. Debian useradd -m convention.
+    def service_home = "/home/#{config.service_user}"
+
     # All template-substitution vars come from two places: git-derived and
     # yaml. Engine-dynamic vars (PORT, DIR, RUBY, RUBY_DIR) layer on top in
     # render_artifacts since they are only known after server probe. The
@@ -51,7 +55,7 @@ module LuxDeploy
       end
     end
 
-    def self.build(opts, render: true)
+    def self.build(opts)
       ctx = new
       ctx.send(:resolve!, opts)
       ctx
@@ -83,7 +87,7 @@ module LuxDeploy
     # always present (web, caddy front); every other file is an extra unit.
     # A leading "!" disables a file (e.g. !job.service) - lux-deploy ignores
     # it everywhere (not a service, not rsync'd). Pure filesystem lookup -
-    # no ssh - so it works in render:false (destroy).
+    # no ssh - so commands that never render (destroy, server:*) can use it.
     def services
       @services ||= begin
         prefix = config.service_prefix
@@ -115,6 +119,7 @@ module LuxDeploy
       raise Error.new("missing #{@config_dir}/ directory") unless Dir.exist?(@config_dir)
 
       @config = Config.load
+      @config.on_fail # validate now: inside the failure handler is too late to learn about a typo
       @templates_dir = opts[:templates_dir]
 
       @host = (opts[:server].to_s.strip.empty? ? @config.server : opts[:server]).to_s.strip
@@ -122,7 +127,7 @@ module LuxDeploy
 
       @ssh    = SSH.new(@host, service_user: @config.service_user, dry_run: opts[:dry_run] || false)
       @branch = Template.git_vars[:GIT_BRANCH]
-      @env_template_name = LuxDeploy::MAIN_BRANCHES.include?(@branch) ? '.env' : '.env.staging'
+      @env_template_name = pick_env_template(@branch)
 
       # App slug comes from yaml `domain:` only. Multi-host strings like
       # "foo.com, *.foo" are allowed; the slug is the first comma-split
@@ -136,8 +141,20 @@ module LuxDeploy
       @app_dir = File.join(@config.remote_base, domain)
     end
 
+    # A per-branch `.env.<branch>` wins when it exists (slashes underscored, so
+    # feature/x -> .env.feature_x), otherwise the historical main/staging split.
+    # `.env.local` is never a branch template - it is the name of the
+    # server-side overlay, and a branch called "local" must not hijack it.
+    def pick_env_template(branch)
+      [".env.#{branch}", ".env.#{branch.gsub(/[^A-Za-z0-9]+/, '_')}"].uniq.each do |name|
+        next if name == '.env.local'
+        return name if template_source(name)
+      end
+      LuxDeploy::MAIN_BRANCHES.include?(branch) ? '.env' : '.env.staging'
+    end
+
     def detect_ruby_path
-      return "/home/#{config.service_user}/.local/share/mise/installs/ruby/CURRENT/bin/ruby" if @ssh.dry_run
+      return "#{service_home}/.local/share/mise/installs/ruby/CURRENT/bin/ruby" if @ssh.dry_run
       out = @ssh.run(<<~SH, as: :service, allow_fail: true)
         ls -td ~/.local/share/mise/installs/ruby/*/bin/ruby 2>/dev/null | head -n1 || which ruby
       SH

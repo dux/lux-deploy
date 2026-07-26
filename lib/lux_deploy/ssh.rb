@@ -1,3 +1,4 @@
+require 'fileutils'
 require 'open3'
 require 'shellwords'
 
@@ -8,11 +9,17 @@ module LuxDeploy
   class SSH
     attr_reader :host, :dry_run, :service_user
 
+    # A deploy makes 15-20 remote calls; without multiplexing each one pays a
+    # full TCP + auth handshake. %C hashes the connection tuple, which keeps
+    # the socket path under the sun_path length limit.
+    CONTROL_PATH ||= '~/.ssh/lux-deploy-%C'
+
     def initialize(host, service_user: 'deployer', dry_run: false)
       raise Error.new('config/deploy/.yaml server: is empty') if host.to_s.strip.empty?
       @host = host.to_s.strip.sub(/^.*@/, '')
       @service_user = service_user
       @dry_run = dry_run
+      @multiplex = control_dir_available?
     end
 
     # Run a command. Returns stdout (always captured).
@@ -45,6 +52,7 @@ module LuxDeploy
     def rsync(src, dest_path, excludes: [])
       argv = [
         'rsync', '-az', '--delete',
+        '-e', (['ssh'] + control_opts).join(' '),
         *excludes.flat_map { |e| ['--exclude', e] },
         "--rsync-path=sudo -u #{service_user} rsync",
         src, "root@#{host}:#{dest_path}"
@@ -67,7 +75,7 @@ module LuxDeploy
 
     # scp a file from the remote (as root) to a local path.
     def scp_from(remote_path, local_path)
-      argv = ['scp', '-o', 'StrictHostKeyChecking=accept-new',
+      argv = ['scp', *control_opts, '-o', 'StrictHostKeyChecking=accept-new',
               "root@#{host}:#{remote_path}", local_path]
       log argv, "scp #{remote_path} -> #{local_path}"
       return if dry_run
@@ -77,7 +85,7 @@ module LuxDeploy
     # scp a local file up to the remote (as root). Default umask leaves
     # the file 0644 so the service user can read it from /tmp.
     def scp_to(local_path, remote_path)
-      argv = ['scp', '-o', 'StrictHostKeyChecking=accept-new',
+      argv = ['scp', *control_opts, '-o', 'StrictHostKeyChecking=accept-new',
               local_path, "root@#{host}:#{remote_path}"]
       log argv, "scp #{local_path} -> #{remote_path}"
       return if dry_run
@@ -90,10 +98,28 @@ module LuxDeploy
       [
         'ssh',
         *(interactive ? ['-tt'] : ['-o', 'BatchMode=yes']),
+        *control_opts,
         '-o', 'StrictHostKeyChecking=accept-new',
         '-o', 'ConnectTimeout=10',
         "root@#{host}"
       ]
+    end
+
+    def control_opts
+      return [] unless @multiplex
+      ['-o', 'ControlMaster=auto',
+       '-o', "ControlPath=#{CONTROL_PATH}",
+       '-o', 'ControlPersist=60s']
+    end
+
+    # Multiplexing is an optimization, never a requirement: without a usable
+    # ~/.ssh (no HOME, read-only home, a container/cron user) we simply don't
+    # ask for it rather than failing every command.
+    def control_dir_available?
+      FileUtils.mkdir_p(File.expand_path('~/.ssh'), mode: 0o700)
+      true
+    rescue SystemCallError, ArgumentError
+      false
     end
 
     def wrap(cmd, as, interactive: false)
