@@ -52,7 +52,12 @@ module LuxDeploy
       {
         GIT_BRANCH:            branch,
         GIT_BRANCH_UNDERSCORE: branch.gsub(/[^A-Za-z0-9]+/, '_'),
-        GIT_BRANCH_SLUG:       slug(branch)
+        GIT_BRANCH_SLUG:       slug(branch),
+        # Deliberately not memoized: the test suite builds contexts in several
+        # throwaway repos in one process, and a cached sha would leak between
+        # them. A handful of rev-parses per run is not worth the trap.
+        GIT_COMMIT:            `git rev-parse HEAD 2>/dev/null`.strip,
+        GIT_COMMIT_SHORT:      `git rev-parse --short HEAD 2>/dev/null`.strip
       }
     end
   end

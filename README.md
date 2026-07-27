@@ -425,13 +425,26 @@ Consumers: humans, LLMs, monitoring scripts, and lux-deploy itself - `status`, `
 
 Every template (the branch's `.env.*`, `caddy.conf`, and each `*.service` unit) is rendered in a single pass with the same vars:
 
-1. **Git** (computed locally): `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`
+1. **Git** (computed locally): `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`, `{{GIT_BRANCH_SLUG}}`, `{{GIT_COMMIT}}`, `{{GIT_COMMIT_SHORT}}`
 2. **App** (derived from `domain:`): `{{APP}}`, `{{APP_UNDERSCORE}}`, `{{HASH}}` (`h` + first 6 SHA-256 hex chars of the main domain), `{{TAG}}` (`s` + first 5 SHA-256 hex chars of the main domain)
 3. **`.yaml`**: every non-behavioral key uppercased -- `{{SERVER}}`, `{{DOMAIN}}`, etc.
 4. **Ports**: `{{PORT}}` and any `{{PORT_*}}` -- reused from the existing `.env`, or first free ports in `3010..3990` step 10
 5. **Derived**: `{{DIR}}`, `{{LOG_DIR}}`, `{{LOG_NAME}}`, `{{SERVICE_USER}}`, `{{SERVICE_HOME}}`, plus `{{RUBY}}`/`{{RUBY_DIR}}` only when a template references them
 
 An unresolved `{{VAR}}` is an error, not a silently shipped placeholder; `doctor` runs the same check locally before you deploy.
+
+Careful with `{{TAG}}`: it is the domain hash used to name Caddy snippets, nothing to do with git.
+The commit is `{{GIT_COMMIT_SHORT}}`, which is what you want for a container image tag:
+
+```ini
+# config/deploy/systemd.service - ExecStart is yours, it need not be a ruby process
+ExecStart=/usr/bin/docker run --rm --name {{APP_UNDERSCORE}} \
+  -p 127.0.0.1:{{PORT}}:8080 --env-file {{DIR}}/.env myapp:{{GIT_COMMIT_SHORT}}
+```
+
+Put `DEPLOY_SHA={{GIT_COMMIT_SHORT}}` in the branch's `.env.*` and `remote_before.sh` can build that same tag -- hooks run with `.env` sourced.
+Rollback restores both the unit and `.env` from `release/.lux-deploy/`, so the image tag goes back with the code rather than drifting from it.
+That only holds for an immutable per-commit tag, and only while the previous image is still on the box -- an aggressive `docker image prune` will leave you with a rollback that swaps code back and then cannot start.
 
 `.env` does **not** feed back into the placeholder namespace.
 It is a runtime-only file -- rendered once, uploaded, and read by the running app at boot.

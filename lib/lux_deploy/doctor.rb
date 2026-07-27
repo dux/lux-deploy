@@ -15,7 +15,7 @@ module LuxDeploy
     # Placeholders the engine always provides at deploy time; templates
     # may reference these without declaring them in .env or .yaml.
     PROVIDED_VARS ||= %w[
-      GIT_BRANCH GIT_BRANCH_UNDERSCORE GIT_BRANCH_SLUG
+      GIT_BRANCH GIT_BRANCH_UNDERSCORE GIT_BRANCH_SLUG GIT_COMMIT GIT_COMMIT_SHORT
       APP APP_UNDERSCORE APP_DOMAIN DOMAIN HASH TAG
       PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME SERVICE_USER SERVICE_HOME
     ].freeze
