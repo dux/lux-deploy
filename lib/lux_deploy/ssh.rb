@@ -9,6 +9,11 @@ module LuxDeploy
   class SSH
     attr_reader :host, :dry_run, :service_user
 
+    # Silences the per-command echo. Only the TUI sets it: that echo goes to
+    # stderr, which shares the terminal it is drawing on, so every refresh
+    # scribbled over the screen.
+    attr_accessor :quiet
+
     # A deploy makes 15-20 remote calls; without multiplexing each one pays a
     # full TCP + auth handshake. %C hashes the connection tuple, which keeps
     # the socket path under the sun_path length limit.
@@ -146,6 +151,7 @@ module LuxDeploy
     end
 
     def log(_argv, summary)
+      return if quiet
       prefix = dry_run ? '  [dry] ' : '  $ '
       head = summary.lines.first.to_s.chomp
       head += ' …' if summary.lines.count > 1

@@ -128,3 +128,23 @@ class TuiRenderTest < Minitest::Test
     refute_includes out, 'q quit'
   end
 end
+
+# SSH echoes every command to stderr, which shares the terminal the TUI draws
+# on - each refresh used to scribble over the screen.
+class TuiQuietTest < Minitest::Test
+  # dry_run so this never touches the network - the echo happens before the
+  # early return, which is exactly the code under test.
+  def ssh = LuxDeploy::SSH.new('example.com', dry_run: true)
+
+  def test_the_command_echo_is_on_by_default
+    _, err = capture_io { ssh.run('true') }
+    assert_includes err, 'true'
+  end
+
+  def test_quiet_silences_it
+    s = ssh
+    s.quiet = true
+    _, err = capture_io { s.run('true') }
+    assert_empty err
+  end
+end

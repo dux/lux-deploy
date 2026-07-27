@@ -30,6 +30,7 @@ module LuxDeploy
     end
 
     def run
+      @ssh.quiet = true # its command echo goes to stderr, i.e. onto this screen
       refresh!
       $stdin.raw!
       print "\e[?25l" # hide cursor
@@ -39,6 +40,7 @@ module LuxDeploy
         break unless handle(read_key)
       end
     ensure
+      @ssh.quiet = false
       $stdin.cooked!
       print "\e[?25h\e[2J\e[H"
     end
