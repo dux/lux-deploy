@@ -112,6 +112,12 @@ module LuxDeploy
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.log(opts.merge(templates_dir: tdir)) } }
       end
 
+      target.task :tui do
+        desc 'Live view of every app on the host - state, restarts, ports, logs, restart/stop/start'
+        opt :server, desc: 'Override hostname from config/deploy/.yaml'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.tui(opts) } }
+      end
+
       target.task :status do
         desc 'What is live: commit, units, ports, rollback availability'
         opt :server, desc: 'Override hostname from config/deploy/.yaml'

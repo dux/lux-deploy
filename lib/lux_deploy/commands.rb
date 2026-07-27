@@ -750,35 +750,40 @@ module LuxDeploy
     end
 
     # Every app on the host, straight from the manifests. One ssh round trip.
+    # Now reports what is *running*, not just what a deploy installed. The
+    # manifest alone showed authcog's job runner as a healthy installed unit
+    # while it had crash-looped 691,459 times.
     def host_apps(opts)
       config = Config.load
       ssh    = prepare_ssh(opts)
       step "apps in #{config.remote_base} on #{ssh.host}"
 
-      raw = ssh.run(<<~SH, allow_fail: true)
-        for f in #{Shellwords.escape(config.remote_base)}/*/#{Manifest::FILENAME} #{Shellwords.escape(config.remote_base)}/*/*/#{Manifest::FILENAME}; do
-          [ -f "$f" ] || continue
-          echo "__APP__ $f"
-          cat "$f"
-        done
-      SH
+      apps, ports = HostState.gather(ssh, config)
 
-      rows = raw.split('__APP__ ').drop(1).filter_map do |chunk|
-        man = RemoteState.parse(chunk.split("\n", 2).last)
-        next unless man
-        [man['app'].to_s,
-         man.dig('git', 'branch').to_s,
-         RemoteState.commit(man),
-         (man.dig('deploy', 'ports') || {}).values.join(','),
-         man['deployed_at'].to_s]
+      rows = apps.map do |app|
+        dead = app.units.reject(&:healthy?)
+        [app.name + (app.legacy ? ' *' : ''),
+         app.branch,
+         app.commit,
+         app.ports.map { |p| ports.include?(p) ? p : "#{p}!" }.join(','),
+         dead.empty? ? "#{app.units.size} ok" : dead.map { |u| "#{u.name}=#{u.missing? ? 'MISSING' : u.state}" }.join(' '),
+         app.deployed_at]
       end
 
       return puts('  (none)') if rows.empty?
-      head  = %w[APP BRANCH COMMIT PORTS DEPLOYED]
+      head  = %w[APP BRANCH COMMIT PORTS UNITS DEPLOYED]
       width = head.each_index.map { |i| ([head[i]] + rows.map { |r| r[i] }).map(&:length).max }
       [head, *rows.sort_by(&:first)].each do |r|
         puts '  ' + r.each_with_index.map { |c, i| c.ljust(width[i]) }.join('  ').rstrip
       end
+    end
+
+    # -------- tui ----------------------------------------------------------
+
+    def tui(opts)
+      raise Error.new('tui needs an interactive terminal') unless $stdin.tty? && $stdout.tty?
+      config = Config.load
+      Tui.new(prepare_ssh(opts), config).run
     end
 
     # -------- server:ssh --------------------------------------------------

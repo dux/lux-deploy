@@ -268,6 +268,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | `lux-deploy up`        | deploy current branch |
 | `lux-deploy rollback`  | restore the previous release |
 | `lux-deploy migrate`   | move a pre-0.3 flat app dir into the `<domain>/<branch>` layout |
+| `lux-deploy tui`       | live view of every app on the host: state, restart counts, ports, logs, restart/stop/start |
 | `lux-deploy status`    | what is live: commit, units, ports, rollback availability |
 | `lux-deploy redeploy`  | destroy + deploy (fresh PORTs) |
 | `lux-deploy destroy`   | stop this branch's services, unlink caddy/systemd, remove its dir |
