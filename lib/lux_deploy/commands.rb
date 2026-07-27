@@ -48,8 +48,10 @@ module LuxDeploy
       # but nothing is swapped or installed yet.
       check_caddy_conflict!(ctx)
 
-      step 'write rendered .env / systemd.service / caddy.config'
-      upload_artifacts(ctx)
+      # .env only, and only because the hook needs it: new-release/.env is a
+      # symlink to it, and remote_before.sh runs with it sourced.
+      step 'write rendered .env'
+      upload_artifacts(ctx, ['.env'])
 
       run_remote_before_hook(ctx)
 
@@ -63,6 +65,14 @@ module LuxDeploy
         ( [ -d release ] && mv release old-release || true ) && \
         mv new-release release
       SH
+
+      # Held back until the release they describe is actually live. Written
+      # before the swap, a deploy that then failed left <app_dir>/systemd.service
+      # describing a release that never went live - and since the installed unit
+      # is a symlink to it, the next daemon-reload or reboot would have started
+      # the app against a release that does not match it.
+      step 'write rendered systemd.service / caddy.config'
+      upload_artifacts(ctx, ctx.rendered.keys - ['.env'], release: 'release')
 
       ensure_caddy_log_dir(ctx)
 
@@ -1305,9 +1315,14 @@ module LuxDeploy
     # with the code through the swap. Ports are stable across deploys, but
     # ExecStart and the caddy config are not - rolling code back without its
     # unit file gives a mismatched release.
-    def upload_artifacts(ctx)
-      snapshot = "#{ctx.app_dir}/new-release/#{RemoteState::SNAPSHOT_DIR}"
+    # `names` selects which rendered artifacts to write - the deploy writes
+    # .env before the remote_before hook and the rest only once the release is
+    # live, so `release` names the dir the snapshot lands in either side of the
+    # swap.
+    def upload_artifacts(ctx, names = ctx.rendered.keys, release: 'new-release')
+      snapshot = "#{ctx.app_dir}/#{release}/#{RemoteState::SNAPSHOT_DIR}"
       ctx.rendered.each do |name, body|
+        next unless names.include?(name)
         write_remote_file(ctx, "#{ctx.app_dir}/#{name}", body, mode: artifact_mode(name))
         write_remote_file(ctx, "#{snapshot}/#{name}", body, mode: artifact_mode(name))
       end
