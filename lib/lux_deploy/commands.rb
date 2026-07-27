@@ -44,6 +44,10 @@ module LuxDeploy
       ensure_toolchain_installed(ctx)
       render_artifacts(ctx)
 
+      # Last point before anything on the box changes: new-release is staged
+      # but nothing is swapped or installed yet.
+      check_caddy_conflict!(ctx)
+
       step 'write rendered .env / systemd.service / caddy.config'
       upload_artifacts(ctx)
 
@@ -152,6 +156,58 @@ module LuxDeploy
         "  definition) - taking every site on the host down with it.\n" \
         "  Move it first:  lux-deploy migrate"
       )
+    end
+
+    # check_legacy_layout! only looks where THIS app would live, so it misses a
+    # conflict parked under another name - an app whose `domain:` was renamed
+    # leaves its old dir and site file behind, still claiming our addresses.
+    # Caddy adapts /etc/caddy/sites/*.caddy as one config and rejects the whole
+    # thing on a duplicate address, so the blast radius is every site on the
+    # host. Compare rendered addresses against what is already installed.
+    def check_caddy_conflict!(ctx)
+      return if ctx.ssh.dry_run
+      mine = flat_site_addresses(ctx.rendered['caddy.config'])
+      return if mine.empty?
+
+      clashes = installed_site_addresses(ctx).filter_map do |file, addresses|
+        next if File.basename(file) == "#{ctx.app}.caddy"
+        hits = addresses & mine
+        [file, hits] if hits.any?
+      end
+      return if clashes.empty?
+
+      detail = clashes.map { |file, hits| "    #{file} also claims #{hits.join(', ')}" }
+      raise Error.new(
+        "caddy site conflict on #{ctx.host} - refusing to install #{ctx.app}.caddy.\n" +
+        detail.join("\n") + "\n" \
+        "  Caddy rejects its entire config on a duplicate site address, so this would take\n" \
+        "  every site on the host down, not just this app.\n" \
+        "  Remove the stale site (and its app dir) first, or change this app's domain."
+      )
+    end
+
+    # {file => [site addresses]} for every installed caddy site file. One ssh
+    # call; __LUX_F__ markers delimit the files in the concatenated output.
+    def installed_site_addresses(ctx)
+      out = ctx.ssh.run(<<~SH, allow_fail: true)
+        for f in #{CADDY_SITES}/*.caddy; do
+          [ -e "$f" ] || continue
+          echo "__LUX_F__ $f"
+          cat "$f"
+        done
+      SH
+      out.to_s.split(/^__LUX_F__ /).reject { |chunk| chunk.strip.empty? }.to_h do |chunk|
+        file, _, body = chunk.partition("\n")
+        [file.strip, flat_site_addresses(body)]
+      end
+    end
+
+    # One address per entry. site_addresses keeps a site's addresses on the one
+    # line it was written on ("a.com, *.a.com") because caddy:doctor prints them
+    # that way; a conflict is per-address, so compare them split out. Scheme is
+    # part of the address - http://a.com and https://a.com are separate sites.
+    def flat_site_addresses(body)
+      (site_addresses(body) - ['?']).flat_map { |line| line.split(',') }.map(&:strip).reject(&:empty?).uniq
     end
 
     # Convert the pre-0.3 layout in place: move the app's payload down into
@@ -421,9 +477,17 @@ module LuxDeploy
         next unless name
         [name.sub(/\.caddy\z/, ''),
          site_addresses(body).join('; '),
-         body.to_s[/reverse_proxy\s+(\S+)/, 1] || '-',
+         proxy_upstream(body) || '-',
          target.to_s.strip]
       end
+    end
+
+    # A caddy.conf routinely documents an upstream it deliberately does NOT
+    # publish (an admin port, an agent endpoint) in a comment block. Matching
+    # that reports the wrong port and, in `status`, a MISMATCH against a
+    # perfectly healthy deploy.
+    def proxy_upstream(body)
+      body.to_s.lines.reject { |l| l.lstrip.start_with?('#') }.join[/reverse_proxy\s+(\S+)/, 1]
     end
 
     # Site addresses are the top-level lines ending in "{" - which excludes
@@ -629,7 +693,7 @@ module LuxDeploy
       puts '  wiring'
       out.lines.map(&:rstrip).reject(&:empty?).each { |l| puts "    #{l}" }
 
-      upstream = read_remote_file(ctx, "#{ctx.app_dir}/caddy.config")[/reverse_proxy\s+\S*?:(\d+)/, 1]
+      upstream = proxy_upstream(read_remote_file(ctx, "#{ctx.app_dir}/caddy.config")).to_s[/:(\d+)/, 1]
       env_port = read_existing_ports(ctx)[:PORT]
       return unless upstream && env_port
       match = upstream.to_i == env_port

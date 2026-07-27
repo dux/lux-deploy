@@ -526,6 +526,15 @@ Error: adapting config using caddyfile: ambiguous site definition: example.com
 
 Caddy validates before swapping, so nothing breaks - but the config is rejected as a whole, which would take every other site on the host with it. `up` therefore refuses to run while the old layout is present and points you here. Port allocation reads both layouts, so a not-yet-migrated app keeps its ports reserved in the meantime.
 
+That guard only looks where *this* app would live, so it misses a conflict parked under another name - most often an app whose `domain:` was changed at the same time as the upgrade, leaving its old dir and site file behind under the old name. `migrate` does not cover a rename either: it moves `<remote_base>/<old-domain>/`, which no longer matches. Move that one by hand, then delete the stale `/etc/caddy/sites/<old-domain>.caddy` and its units.
+
+As a backstop, `up` compares its rendered site addresses against every file already in `/etc/caddy/sites/` and refuses if anything else claims one, before it installs or swaps anything:
+
+```
+ERROR: caddy site conflict on deb1 - refusing to install sohotasks.com-main.caddy.
+    /etc/caddy/sites/soho_tasks.caddy also claims http://sohotasks.com, http://*.sohotasks.com
+```
+
 **3. `prepare:nginx` is gone.** It installed nginx but no deploy could ever emit an nginx site file. See *Why Caddy, and only Caddy* above.
 
 Also new in 0.3.0: the health gate (`health:`, `boot_timeout:`, `health_path:`, `config/deploy/health.sh`), `rollback` + `on_fail:`, `env:list/get/set/edit` over a server-side `.env.local`, `status`, `host:apps`, `caddy:doctor`, and a deploy lock.
