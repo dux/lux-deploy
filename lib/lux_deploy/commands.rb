@@ -946,14 +946,27 @@ module LuxDeploy
     end
 
     # A unit can bind its port and then die; systemd knows before we do.
+    #
+    # is-active alone is not enough for a Restart=always unit: it flips between
+    # active and activating as it crash-loops, so a check landing in the wrong
+    # 5-second window calls a broken unit healthy. NRestarts is the reliable
+    # half - systemctl resets it on the explicit restart this deploy just did,
+    # so anything above zero means the unit has already died at least once.
     def assert_units_active(ctx, services)
-      out = ctx.ssh.run(services.map { |s| "echo \"#{s.unit} $(systemctl is-active #{s.unit} 2>/dev/null)\"" }.join("\n"),
-                        allow_fail: true)
-      dead = out.lines.map(&:split).select { |_u, state| state && state != 'active' }
+      out = ctx.ssh.run(services.map do |s|
+        "echo \"#{s.unit} $(systemctl is-active #{s.unit} 2>/dev/null) " \
+        "$(systemctl show #{s.unit} -p NRestarts --value 2>/dev/null)\""
+      end.join("\n"), allow_fail: true)
+
+      dead = out.lines.map(&:split).filter_map do |unit, state, restarts|
+        next unless state
+        next "#{unit} is #{state}"                        if state != 'active'
+        "#{unit} restarted #{restarts}x since deploy"     if restarts.to_i.positive?
+      end
       return if dead.empty?
 
       dump_journal(ctx, services)
-      raise Error.new("health gate failed: #{dead.map { |u, s| "#{u} is #{s}" }.join(', ')}")
+      raise Error.new("health gate failed: #{dead.join(', ')}")
     end
 
     def gate_failure(out)

@@ -77,6 +77,43 @@ class HealthGateTest < Minitest::Test
     end
   end
 
+  # authcog's job runner sat at 691,459 restarts for six weeks while every
+  # deploy reported success: a Restart=always unit flips between active and
+  # activating, so is-active alone calls it healthy half the time. NRestarts
+  # is reset by the explicit restart the deploy just did, so nonzero means
+  # the unit has already died once.
+  class Ssh < Struct.new(:out)
+    def run(_cmd, **_opts) = out
+    def stream(*, **) = nil            # dump_journal, on the failure path
+  end
+
+  def gate(lines)
+    svc = LuxDeploy::Context::Service
+    ctx = Struct.new(:ssh).new(Ssh.new(lines))
+    services = lines.lines.map { |l| svc.new('web', nil, nil, l.split.first, true) }
+    capture_io { return LuxDeploy::Commands.assert_units_active(ctx, services) }
+  end
+
+  def test_an_active_unit_that_never_restarted_passes
+    assert_nil gate("web-a active 0\n")
+  end
+
+  def test_a_unit_that_already_crash_looped_fails_even_while_active
+    err = assert_raises(LuxDeploy::Error) { gate("web-a active 4\n") }
+    assert_includes err.message, 'web-a restarted 4x since deploy'
+  end
+
+  def test_an_inactive_unit_still_fails
+    err = assert_raises(LuxDeploy::Error) { gate("web-a activating 0\n") }
+    assert_includes err.message, 'web-a is activating'
+  end
+
+  # A unit systemctl knows nothing about reports neither state nor count -
+  # skipped rather than reported as a phantom failure.
+  def test_an_unknown_unit_is_not_a_failure
+    assert_nil gate("web-a\n")
+  end
+
   def test_gate_failure_names_what_went_wrong
     assert_equal 'nothing listening on port 3010',
                  LuxDeploy::Commands.gate_failure("__DOWN__ 3010\n")
