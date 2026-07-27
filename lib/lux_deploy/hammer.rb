@@ -95,7 +95,10 @@ module LuxDeploy
       target.task :doctor do
         desc 'Check & prepare host: service user, dirs, caddy, ruby, bundler'
         opt :server, desc: 'Override hostname from config/deploy/.yaml'
-        opt :fix,     type: :boolean, default: true, desc: 'Auto-fix safe items (default true; --no-fix to skip)'
+        # Declared as the negative on purpose: the parser no longer generates an
+        # automatic --no-<flag>, so `opt :fix, default: true` left no way to
+        # turn fixing off while still advertising --no-fix in its own help.
+        opt :no_fix,  type: :boolean, desc: 'Do not auto-fix safe items (default is to fix)'
         opt :dry_run, type: :boolean, default: false, desc: 'Print the remote checks, do not run them'
 
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.doctor(opts) } }
