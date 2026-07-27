@@ -246,6 +246,13 @@ module LuxDeploy
         opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
         proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_bun(opts) } }
       end
+
+      target.task :docker do
+        desc 'Install Docker + compose, and let the service user reach the daemon'
+        opt :server,  desc: 'Override hostname from config/deploy/.yaml'
+        opt :dry_run, type: :boolean, default: false, desc: 'Print commands, do not execute'
+        proc { |opts| LuxDeploy::Hammer.safe(opts) { LuxDeploy::Commands.prepare_docker(opts) } }
+      end
     end
 
     def define_server_on(target, tdir)

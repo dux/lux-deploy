@@ -1,7 +1,7 @@
 # lux-deploy
 
 Stupid-simple deploy via SSH + rsync.
-No Docker. No registry. No JSON.
+No Docker required. No registry. No JSON.
 
 Caddy + systemd + atomic-release deploys.
 The primary configuration lives in `config/deploy/.yaml`, with an optional non-secret `config/deploy/src` override for the local deploy artifact.
@@ -79,6 +79,7 @@ bundle exec lux-deploy status        # what is live
 lux-deploy prepare:caddy     # install Caddy, create /etc/caddy/sites, wire the import, enable
 lux-deploy prepare:mise      # install mise for the service user, activate it in the login shell
 lux-deploy prepare:bun       # install Bun for the service user
+lux-deploy prepare:docker    # install Docker + compose, let the service user reach the daemon
 lux-deploy caddy:log:prepare # install Bun + the host-wide access-log -> SQLite importer
 ```
 
@@ -281,6 +282,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 | `lux-deploy prepare:caddy` | install + configure Caddy on the host (sites dir, import, enable) |
 | `lux-deploy prepare:mise` | install mise for the service user + activate it in the login shell |
 | `lux-deploy prepare:bun` | install Bun for the service user |
+| `lux-deploy prepare:docker` | install Docker + compose, add the service user to the docker group |
 | `lux-deploy caddy:doctor` | check the caddy install + table every site file on the host |
 | `lux-deploy caddy:log:prepare` | install Bun + the host-wide access-log -> SQLite importer |
 | `lux-deploy caddy:log:status` | importer service status + this app's SQLite stats |

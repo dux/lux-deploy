@@ -84,6 +84,47 @@ module LuxDeploy
       SH
     end
 
+    # Install Docker (engine + compose plugin) and let the service user reach
+    # the daemon. Idempotent.
+    #
+    # get.docker.com rather than `apt-get install docker.io`: the distro package
+    # has no compose v2 on Debian stable, and a unit running `docker compose up`
+    # would fail with nothing but "unknown command".
+    #
+    # Adding the service user to the docker group hands it root-equivalent
+    # access to the host - the daemon runs as root and will bind-mount anything
+    # you ask it to. That is unavoidable for rootless-less docker deploys, but
+    # it is why this lives behind an explicit `prepare:docker` and why doctor
+    # only reports the missing group rather than quietly fixing it.
+    def docker(ssh)
+      user = ssh.service_user
+      ssh.stream(<<~SH)
+        set -e
+        if command -v docker >/dev/null; then
+          echo "docker already installed: $(docker --version)"
+        else
+          echo 'installing docker (get.docker.com)'
+          curl -fsSL https://get.docker.com | sh
+        fi
+
+        systemctl enable --now docker
+
+        if id -nG #{user} | grep -qw docker; then
+          echo "#{user} already in the docker group"
+        else
+          echo "adding #{user} to the docker group (root-equivalent on this host)"
+          usermod -aG docker #{user}
+        fi
+
+        docker compose version || echo 'WARNING: no compose plugin - `docker compose` will not work'
+
+        # The group only applies to new login sessions. Every remote step runs
+        # through `sudo -iu`, which starts one, so this is the check that
+        # actually matches how the deploy will call docker.
+        sudo -iu #{user} bash -lc 'docker info >/dev/null' && echo "docker reachable as #{user}"
+      SH
+    end
+
     # Upload the bundled importer script to a host path (root-owned, world-
     # readable so the service user can run it). Atomic write (.new + mv).
     def install_importer(ssh, importer_local, importer_remote)

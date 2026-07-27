@@ -458,6 +458,13 @@ module LuxDeploy
       step "done. bun installed for #{ssh.service_user}"
     end
 
+    def prepare_docker(opts)
+      ssh = prepare_ssh(opts)
+      step "prepare docker on #{ssh.host}"
+      Prepare.docker(ssh)
+      step "done. docker installed, #{ssh.service_user} can reach the daemon"
+    end
+
     # -------- caddy:log:* --------------------------------------------------
 
     # Host setup for access-log ingestion: bun + the bundled importer script +

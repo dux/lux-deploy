@@ -94,6 +94,18 @@ module LuxDeploy
       Dir.glob("#{dir}/*").any? { |f| File.file?(f) && File.read(f).include?('{{RUBY') }
     end
 
+    # True when a unit template drives containers - gates the docker host
+    # checks so every other app is unaffected.
+    #
+    # Only *.service files, and never a "!"-disabled one: those are switched
+    # off everywhere else in the engine, so a !docker.service someone parked
+    # must not make doctor start demanding a docker daemon.
+    def docker?(dir = './config/deploy')
+      Dir.glob("#{dir}/*.service")
+         .reject { |f| File.basename(f).start_with?('!') }
+         .any? { |f| File.file?(f) && File.read(f).match?(/\b(docker|podman)\b/) }
+    end
+
     # True when caddy.conf emits a JSON access log - gates the bun/importer
     # host checks so apps without access logging don't fail doctor.
     def caddy_log?(dir = './config/deploy')
@@ -286,6 +298,35 @@ module LuxDeploy
             "bundler on #{user} PATH",
             "sudo -iu #{user} bash -lc 'command -v bundle >/dev/null'",
             "sudo -iu #{user} bash -lc 'gem install bundler --no-document'"
+          ]
+        ] : []),
+        # Containers: only when a unit template actually drives one.
+        *(docker? ? [
+          [
+            'docker installed',
+            'command -v docker >/dev/null && docker --version',
+            nil
+          ],
+          [
+            'docker daemon running',
+            'systemctl is-active --quiet docker',
+            nil
+          ],
+          # No fix command on purpose. Membership here is root-equivalent on
+          # this host, and doctor applies fixes on its own; granting that
+          # during a routine check is not the engine's call to make.
+          # `lux-deploy prepare:docker` is the explicit opt-in.
+          [
+            "#{user} in the docker group (run prepare:docker to grant)",
+            "id -nG #{user} | grep -qw docker",
+            nil
+          ],
+          # The one that matches reality: the group only applies to a new
+          # login session, and every remote step runs through `sudo -iu`.
+          [
+            "docker reachable as #{user}",
+            "sudo -iu #{user} bash -lc 'docker info >/dev/null 2>&1'",
+            nil
           ]
         ] : []),
         # Access-log ingestion: only when this app emits a JSON access log.
