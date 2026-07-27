@@ -53,6 +53,63 @@ class LegacyUnitsTest < Minitest::Test
     end
   end
 
+  # The manifest moves with the payload still naming the pre-0.3 units, so
+  # status/destroy/rollback would act on units that no longer exist.
+  def test_migrate_repoints_the_manifest_at_the_new_unit_names
+    in_app({ 'job.service' => '' }) do |ctx|
+      manifest = { 'services' => {
+        'web' => { 'unit' => 'web-example.com.service',     'source' => '/apps/example.com/systemd.service' },
+        'job' => { 'unit' => 'web-example.com-job.service', 'source' => '/apps/example.com/systemd.job.service' }
+      } }
+      written = nil
+      LuxDeploy::Commands.define_singleton_method(:write_remote_file) { |_c, _p, body, **| written = body }
+
+      with_manifest(ctx, manifest) { capture_io { LuxDeploy::Commands.rename_manifest_units(ctx) } }
+
+      units = YAML.safe_load(written)['services']
+      assert_equal 'web-example.com-main.service',     units['web']['unit']
+      assert_equal 'web-example.com-main-job.service', units['job']['unit']
+      # source is a record of what rendered it, not a live path - leave it be
+      assert_equal '/apps/example.com/systemd.service', units['web']['source']
+    ensure
+      LuxDeploy::Commands.singleton_class.remove_method(:write_remote_file)
+    end
+  end
+
+  # vibe's case: a job unit was installed by an older deploy, its *.service file
+  # has since been deleted locally, and migrate just tore the unit down. Keeping
+  # it in the manifest leaves status reporting MISSING forever.
+  def test_migrate_drops_units_that_will_never_come_back
+    in_app do |ctx|
+      manifest = { 'services' => {
+        'web' => { 'unit' => 'web-example.com.service',     'source' => '/apps/example.com/systemd.service' },
+        'job' => { 'unit' => 'web-example.com-job.service', 'source' => '/apps/example.com/systemd.job.service' }
+      } }
+      written = nil
+      LuxDeploy::Commands.define_singleton_method(:write_remote_file) { |_c, _p, body, **| written = body }
+
+      with_manifest(ctx, manifest) { capture_io { LuxDeploy::Commands.rename_manifest_units(ctx) } }
+
+      units = YAML.safe_load(written)['services']
+      assert_equal %w[web], units.keys
+      assert_equal 'web-example.com-main.service', units['web']['unit']
+    ensure
+      LuxDeploy::Commands.singleton_class.remove_method(:write_remote_file)
+    end
+  end
+
+  # Nothing to rewrite must not mean writing an empty manifest over a good one.
+  def test_migrate_leaves_an_unreadable_manifest_alone
+    in_app do |ctx|
+      called = false
+      LuxDeploy::Commands.define_singleton_method(:write_remote_file) { |*| called = true }
+      with_manifest(ctx, nil) { LuxDeploy::Commands.rename_manifest_units(ctx) }
+      refute called
+    ensure
+      LuxDeploy::Commands.singleton_class.remove_method(:write_remote_file)
+    end
+  end
+
   # The whole point: the legacy names must differ from what 0.3 installs, or
   # migrate would disable the unit it is about to create.
   def test_legacy_names_differ_from_the_branch_layout

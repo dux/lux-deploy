@@ -253,7 +253,39 @@ module LuxDeploy
         rm -f "$src/.deploy.lock"
       SH
 
+      rename_manifest_units(ctx)
+
       step "done. the site is down until you re-render it: lux-deploy up"
+    end
+
+    # The manifest travels with the payload, still naming the pre-0.3 units.
+    # Left alone, everything that reads it - status, destroy, rollback - reports
+    # and acts on units that no longer exist, which reads as "the app is down"
+    # even once it is serving again. Remap by service name; `up` rewrites the
+    # whole file later, this just keeps the window between honest.
+    def rename_manifest_units(ctx)
+      manifest = RemoteState.read_manifest(ctx)
+      services = manifest.is_a?(Hash) ? manifest['services'] : nil
+      return unless services.is_a?(Hash)
+
+      units  = ctx.services.to_h { |s| [s.name, s.unit] }
+      moved  = []
+      # migrate just tore down every unit this manifest listed. The ones with a
+      # local *.service file come back under the new name on the next `up`; the
+      # rest are gone for good, so drop them rather than leave destroy and
+      # status chasing units that no longer exist anywhere.
+      dropped = services.keys.reject { |name| units.key?(name.to_s) }
+      dropped.each { |name| services.delete(name) }
+
+      services.each do |name, info|
+        next unless info.is_a?(Hash) && (unit = units[name.to_s])
+        moved << [info['unit'], "#{unit}.service"] if info['unit'] != "#{unit}.service"
+        info['unit'] = "#{unit}.service"
+      end
+      return if moved.empty? && dropped.empty?
+
+      step "manifest: #{(moved.map { |from, to| "#{from} -> #{to}" } + dropped.map { |n| "dropped #{n}" }).join(', ')}"
+      write_remote_file(ctx, File.join(ctx.app_dir, Manifest::FILENAME), YAML.dump(manifest))
     end
 
     # Unit names the pre-0.3 layout installed. The old manifest is the record -
