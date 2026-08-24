@@ -25,6 +25,12 @@ module LuxDeploy
 
     # Markers rather than one command per fact - refresh is a keystroke, so it
     # has to be a single round trip.
+    #
+    # Deliberately no container detail here, even for compose apps. Every
+    # per-app `docker compose ps` is a ~300ms fork and they would serialize
+    # inside this script; at ten apps the TUI's refresh becomes a multi-second
+    # stall in an interactive view. `lux-deploy status` shows containers for
+    # one app, which is where you look when a unit is active but wrong.
     def script(config)
       base = Shellwords.escape(config.remote_base)
       <<~SH

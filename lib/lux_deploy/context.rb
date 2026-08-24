@@ -5,6 +5,13 @@ module LuxDeploy
     # any other config/deploy/<name>.service becomes <prefix>-<app>-<name>.
     Service ||= Struct.new(:name, :template, :artifact, :unit, :web)
 
+    # Every name `docker compose` itself accepts, in its own precedence order.
+    # The engine takes all four rather than only the one it documents: someone
+    # who names it compose.yml and silently gets a non-container deploy is the
+    # worse failure. Two present is a typo mid-rename, not a choice to make on
+    # their behalf.
+    COMPOSE_NAMES ||= %w[docker-compose.yaml docker-compose.yml compose.yaml compose.yml].freeze
+
     attr_reader :host, :ssh, :branch, :branch_slug, :app, :app_dir, :app_domain,
                 :domain_list, :config_dir, :env_template_name, :config, :templates_dir
     attr_accessor :ports, :domain, :rendered
@@ -117,13 +124,53 @@ module LuxDeploy
       end
     end
 
+    # The app's compose template, or nil. Presence is the whole mode switch -
+    # there is no `mode:` key, exactly as there is no key for "this app has a
+    # worker" (that is a second *.service file). Parking it as
+    # !docker-compose.yaml disables it, for free: the glob names are exact.
+    #
+    # config_dir only, never the plugin templates_dir - a compose file shipped
+    # by a wrapping gem would otherwise turn on containers for every app that
+    # loads it.
+    def compose_template
+      return @compose_template if defined?(@compose_template)
+      found = COMPOSE_NAMES.select { |n| File.file?(File.join(@config_dir, n)) }
+      raise Error.new("more than one compose file in #{@config_dir}: #{found.join(', ')}") if found.size > 1
+      @compose_template = found.first
+    end
+
+    def compose? = !compose_template.nil?
+
+    # Absolute remote path of the rendered compose file, exposed to every
+    # template as {{COMPOSE_FILE}}. In <app_dir> rather than in the release so
+    # the unit's `-f` never points at a path that vanishes in the swap window.
+    def compose_file = compose? ? File.join(app_dir, compose_template) : nil
+
+    # Every template this deploy renders, mapped to the name it lands under on
+    # the server. The two differ for exactly two entries: the branch's
+    # .env.<x> lands as `.env` and caddy.conf lands as `caddy.config`, because
+    # systemd and caddy read those through symlinks and the names are
+    # load-bearing there.
+    #
+    # Four call sites used to derive this list independently - the port scan,
+    # the ruby probe, the renderer, doctor - and a new kind of template only
+    # had to be forgotten in one of them to ship unrendered. Doctor still
+    # keeps its own scan on purpose; see the comment there.
+    def rendered_templates
+      @rendered_templates ||= begin
+        h = { env_template_name => '.env', 'caddy.conf' => 'caddy.config' }
+        services.each { |s| h[s.template] = s.artifact }
+        h[compose_template] = compose_template if compose?
+        h
+      end
+    end
+
     # True when any rendered template references {{RUBY}}/{{RUBY_DIR}}. Gates
     # the (ssh) ruby probe so a Go/Python app whose unit runs a built binary
     # deploys without a ruby on the box.
     def ruby_used?
       return @ruby_used unless @ruby_used.nil?
-      names = (['caddy.conf', env_template_name] + services.map(&:template)).uniq
-      @ruby_used = names.any? { |n| (s = template_source(n)) && s.include?('{{RUBY') }
+      @ruby_used = rendered_templates.keys.any? { |n| (s = template_source(n)) && s.include?('{{RUBY') }
     end
 
     private

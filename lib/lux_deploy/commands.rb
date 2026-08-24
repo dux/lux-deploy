@@ -48,10 +48,11 @@ module LuxDeploy
       # but nothing is swapped or installed yet.
       check_caddy_conflict!(ctx)
 
-      # .env only, and only because the hook needs it: new-release/.env is a
-      # symlink to it, and remote_before.sh runs with it sourced.
-      step 'write rendered .env'
-      upload_artifacts(ctx, ['.env'])
+      # Only what the hook needs: new-release/.env is a symlink to <app_dir>/.env
+      # and remote_before.sh runs with it sourced, and a compose file is what
+      # that hook builds or pulls against.
+      step 'write rendered .env' + (ctx.compose? ? " + #{ctx.compose_template}" : '')
+      upload_artifacts(ctx, pre_swap_artifacts(ctx))
 
       run_remote_before_hook(ctx)
 
@@ -72,7 +73,7 @@ module LuxDeploy
       # is a symlink to it, the next daemon-reload or reboot would have started
       # the app against a release that does not match it.
       step 'write rendered systemd.service / caddy.config'
-      upload_artifacts(ctx, ctx.rendered.keys - ['.env'], release: 'release')
+      upload_artifacts(ctx, ctx.rendered.keys - pre_swap_artifacts(ctx), release: 'release')
 
       ensure_caddy_log_dir(ctx)
 
@@ -717,10 +718,27 @@ module LuxDeploy
       end
 
       report_wiring(ctx, units)
+      report_containers(ctx)
 
       has_old = ctx.ssh.run("[ -d #{Shellwords.escape(ctx.app_dir)}/old-release ] && echo yes || echo no",
                             as: :service, allow_fail: true)
       puts "  rollback    #{has_old.include?('yes') ? 'available (lux-deploy rollback)' : 'unavailable'}"
+    end
+
+    # `systemctl is-active` says "compose is running", which is true of a stack
+    # where everything but the web container is dead. Same probe the health
+    # gate uses, taken once instead of polled - status reports, it does not
+    # wait. Absent for every non-container app.
+    def report_containers(ctx)
+      return unless ctx.compose?
+      out = ctx.ssh.run("docker compose -f #{Shellwords.escape(ctx.compose_file)} ps --all --format json 2>&1",
+                        allow_fail: true)
+      rows = parse_compose_ps("__PS__\n#{out}")
+      puts "  containers  #{ctx.compose_file}"
+      return puts('    (none)') if rows.empty?
+      rows.each do |r|
+        puts format('    %-20s %-12s %s', r['Service'] || r['Name'], r['State'], r['Health'])
+      end
     end
 
     # Symlinks are the whole install: /etc/caddy/sites and /etc/systemd/system
@@ -911,6 +929,7 @@ module LuxDeploy
 
       await_ports(ctx, gate_ports(ctx), services)
       assert_units_active(ctx, services)
+      assert_containers_healthy(ctx)
     end
 
     # `up` knows the ports it just allocated; rollback and env:set have to read
@@ -995,6 +1014,119 @@ module LuxDeploy
       return "nothing listening on port #{$1}" if out =~ /__DOWN__ (\d+)/
       return "#{$1} did not answer" if out =~ /__UNHEALTHY__ (\S+)/
       'probe did not complete'
+    end
+
+    # -------- container gate -----------------------------------------------
+
+    # A compose stack passes the port gate the moment its web container binds,
+    # while pg crash-loops next to it - and systemd has nothing to add, because
+    # the unit is `docker compose up` and compose stays cheerfully active
+    # either way. So ask compose.
+    #
+    # Runs as root rather than the service user: there is one daemon, the
+    # project is visible to anyone who can reach the socket, and this gate
+    # should report the stack's state and not the service user's permissions -
+    # doctor's "docker reachable as <user>" check already owns that question.
+    def assert_containers_healthy(ctx)
+      return unless ctx.compose?
+
+      file = ctx.compose_file
+      step "health gate: compose stack #{file} (#{ctx.config.boot_timeout}s)"
+      raw = await_compose(ctx, file)
+      return if ctx.ssh.dry_run
+
+      rows = parse_compose_ps(raw)
+      if rows.empty?
+        tail = raw.to_s.lines.map(&:strip).reject(&:empty?).last(3).join(' | ')
+        raise Error.new("health gate failed: compose reported no containers for #{file}.\n  #{tail}")
+      end
+
+      bad = compose_failures(rows)
+      return if bad.empty?
+
+      dump_compose_logs(ctx, file, bad.map(&:first))
+      raise Error.new("health gate failed: #{bad.map(&:last).join(', ')} (#{file}).\n" \
+                      '  The unit is active - compose is running - but the stack is not.')
+    end
+
+    # States worth waiting out rather than failing on. Matched as substrings
+    # remotely because the loop has to run in one round trip on a box with no
+    # jq, and because "Key": "value" pairs are order-independent in a way a
+    # positional regex over the whole object would not be.
+    COMPOSE_PENDING ||= '"(State|Status)":[[:space:]]*"(created|restarting)"|"Health":[[:space:]]*"starting"'
+
+    # Poll, don't sample. await_ports returns the instant the web container
+    # binds its port; a dependent container with a HEALTHCHECK start_period is
+    # still `starting` for another 10-30s after that, so a single check taken
+    # right here fails a perfectly good stack. Same budget knob and the same
+    # loop shape as await_ports, on a 2s tick because every pass forks a
+    # compose client.
+    #
+    # The shell decides "is it still settling", ruby decides "did it settle
+    # well" - the same split await_ports already uses.
+    def await_compose(ctx, file)
+      f = Shellwords.escape(file)
+      ctx.ssh.run(<<~SH, allow_fail: true)
+        i=0
+        while :; do
+          out=$(docker compose -f #{f} ps --all --format json 2>&1 ||
+                docker-compose -f #{f} ps --all --format json 2>&1)
+          printf '%s\\n' "$out" | grep -Eq '#{COMPOSE_PENDING}' || break
+          [ $i -ge #{ctx.config.boot_timeout} ] && break
+          i=$((i + 2))
+          sleep 2
+        done
+        echo __PS__
+        printf '%s\\n' "$out"
+      SH
+    end
+
+    # `--format json` is one JSON object per line on compose v2.21+ and a
+    # single JSON array before it. Neither form is announced, so accept both:
+    # try the whole blob first, fall back to line by line.
+    def parse_compose_ps(raw)
+      body = raw.to_s.split('__PS__', 2).last.to_s.strip
+      return [] if body.empty?
+      whole = begin
+        JSON.parse(body)
+      rescue JSON::ParserError
+        nil
+      end
+      rows = whole.is_a?(Array) ? whole : body.lines.filter_map { |l| JSON.parse(l) rescue nil }
+      rows.grep(Hash)
+    end
+
+    # [[service, reason], ...] for everything that is not up.
+    #
+    # An empty Health passes: it means the image declares no HEALTHCHECK, and
+    # inventing a verdict there would fail every stock postgres image. `exited`
+    # with code 0 passes too - a stack routinely carries a one-shot (migrations,
+    # an asset build) that is *supposed* to be gone by the time the gate looks.
+    def compose_failures(rows)
+      rows.filter_map do |r|
+        name   = (r['Service'] || r['Name']).to_s
+        state  = (r['State']   || r['state']).to_s
+        health = (r['Health']  || r['health']).to_s
+
+        if state == 'exited'
+          code = (r['ExitCode'] || r['exitCode']).to_i
+          next if code.zero?
+          next [name, "#{name} exited #{code}"]
+        end
+        next [name, "#{name} is #{state}"]  unless state == 'running'
+        next [name, "#{name} is #{health}"] unless health.empty? || health == 'healthy'
+        nil
+      end
+    end
+
+    # The container's stdout is where the answer is, and for a `compose up -d`
+    # unit it never reaches the journal at all - dump_journal would print an
+    # empty page for exactly the failure this gate exists to catch. Failing
+    # services only, or a six-container stack buries the one line that matters.
+    def dump_compose_logs(ctx, file, names, lines: 40)
+      $stderr.puts "  --- docker compose -f #{file} logs --tail #{lines} #{names.join(' ')} ---"
+      ctx.ssh.stream("docker compose -f #{Shellwords.escape(file)} logs --no-color --tail #{lines} " \
+                     "#{names.map { |n| Shellwords.escape(n) }.join(' ')}", allow_fail: true)
     end
 
     # The journal is the first thing anyone would look at next, so print it
@@ -1187,7 +1319,7 @@ module LuxDeploy
       if (src = ctx.template_source(ctx.env_template_name))
         keys.concat(src.scan(/^(PORT[A-Z0-9_]*)\s*=/).flatten)
       end
-      (['caddy.conf'] + ctx.services.map(&:template)).uniq.each do |n|
+      ctx.rendered_templates.each_key do |n|
         src = ctx.template_source(n) or next
         keys.concat(src.scan(/\{\{(PORT[A-Z0-9_]*)\}\}/).flatten)
       end
@@ -1267,23 +1399,23 @@ module LuxDeploy
       if ctx.ruby_used?
         vars = vars.merge(RUBY: ctx.ruby_path, RUBY_DIR: File.dirname(ctx.ruby_path))
       end
+      # Same gating for COMPOSE_FILE: only a container app gets it, so
+      # {{COMPOSE_FILE}} in a non-container unit fails the render rather than
+      # rendering a path to a file that was never uploaded.
+      vars = vars.merge(COMPOSE_FILE: ctx.compose_file) if ctx.compose?
 
-      # .env.local (server-only, set by `env:set`) layers over the rendered
-      # template, then PORT* over that - ports are engine-owned, so a pinned
-      # PORT in the overlay would just desync caddy from the unit.
-      # Persisting the ports into .env is also what makes allocate_ports
-      # reuse them next deploy instead of drifting.
-      env_body = Template.render(ctx.read_template(ctx.env_template_name), vars)
-      env_body = merge_env(env_body, read_env_overlay(ctx))
-      env_body = merge_env(env_body, ctx.ports)
-
-      rendered = {
-        '.env'         => env_body,
-        'caddy.config' => Template.render(ctx.read_template('caddy.conf'), vars)
-      }
-      ctx.services.each do |s|
-        rendered[s.artifact] = Template.render(ctx.read_template(s.template), vars)
+      rendered = ctx.rendered_templates.to_h do |template, artifact|
+        [artifact, Template.render(ctx.read_template(template), vars)]
       end
+
+      # .env is the one artifact with post-processing. .env.local (server-only,
+      # set by `env:set`) layers over the rendered template, then PORT* over
+      # that - ports are engine-owned, so a pinned PORT in the overlay would
+      # just desync caddy from the unit. Persisting the ports into .env is also
+      # what makes allocate_ports reuse them next deploy instead of drifting.
+      rendered['.env'] = merge_env(rendered['.env'], read_env_overlay(ctx))
+      rendered['.env'] = merge_env(rendered['.env'], ctx.ports)
+
       ctx.rendered = rendered
     end
 
@@ -1341,6 +1473,13 @@ module LuxDeploy
     end
 
     def artifact_mode(name) = name == '.env' ? '0600' : '0644'
+
+    # What remote_before.sh needs in place before it runs: .env (new-release/
+    # symlinks to it and the hook is run with it sourced) and the compose file,
+    # because `docker compose pull` / `build` is exactly the kind of thing that
+    # hook is for and a file arriving after the swap is useless to it.
+    # Everything else is held back until the release it describes is live.
+    def pre_swap_artifacts(ctx) = ['.env'] + [ctx.compose_template].compact
 
     # Atomic remote write as the service user: base64 in, .new, mv, chmod.
     def write_remote_file(ctx, remote_path, body, mode: '0644')

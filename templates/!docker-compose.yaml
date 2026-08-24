@@ -1,0 +1,61 @@
+# docker-compose.yaml - lux-deploy container mode.
+#
+# DISABLED. Rename to `docker-compose.yaml` to use it - the leading "!" is the
+# gem-wide disable convention, so this file is ignored and never rsynced until
+# you drop the prefix.
+#
+# Its presence IS the mode switch. There is no `mode:` key: once this file is
+# here, lux-deploy renders it like any other template, uploads it to
+# <app_dir>/docker-compose.yaml before remote_before.sh runs (so a hook can
+# `docker compose pull` or `build` against it), snapshots it so `rollback`
+# restores it with the code, and extends the health gate to assert every
+# container is running and, where the image declares a HEALTHCHECK, healthy.
+#
+# Point your unit at it and drop the ruby lines - see systemd.service:
+#   ExecStart=/usr/bin/docker compose -f {{COMPOSE_FILE}} up
+#
+# Run `lux-deploy prepare:docker` once per host first.
+#
+# The same placeholders the units get. One the engine cannot resolve fails the
+# deploy rather than shipping literally - `lux-deploy doctor` catches it
+# locally first.
+
+# REQUIRED. Without it compose derives the project name from this file's
+# directory, which is <remote_base>/<domain>/<branch> - so every app on this
+# host deploying `main` would share the project "main", and `compose down` in
+# one could tear down another's containers. doctor fails without it.
+name: {{APP}}
+
+services:
+  web:
+    # Immutable per-commit tag, so `rollback` puts the image back with the
+    # code. Build it in remote_before.sh, or pull it from your registry.
+    image: myapp:{{GIT_COMMIT_SHORT}}
+    restart: unless-stopped
+    # Secrets stay out of this file - it is uploaded 0644. Values live in
+    # <app_dir>/.env (rendered from .env.main, plus `lux-deploy env:set`).
+    env_file: {{DIR}}/.env
+    # The port contract: bind the PORT lux-deploy allocated, on loopback only.
+    # Caddy is the only thing that should reach it.
+    ports:
+      - '127.0.0.1:{{PORT}}:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file: {{DIR}}/.env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Declare a healthcheck and the deploy gate waits for it. Without one the
+    # gate can only prove the container is running.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

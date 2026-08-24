@@ -6,11 +6,19 @@ After=network.target
 Type=simple
 User={{SERVICE_USER}}
 WorkingDirectory={{DIR}}/release
-# {{RUBY}} dir must be on PATH so `bundle` resolves under -S.
+# The ruby dir must be on PATH so `bundle` resolves under -S. Written without
+# a placeholder on purpose: doctor gates its ruby host checks on any file
+# mentioning that var, comments included, so a container app that drops the
+# line below but keeps this comment would still be told to install ruby.
 Environment="PATH={{RUBY_DIR}}:{{SERVICE_HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Edit this line for your stack. Examples:
 #   ExecStart={{RUBY}} -S bundle exec puma -p {{PORT}} -e production
 #   ExecStart={{RUBY}} -S bundle exec rackup -p {{PORT}} -E production
+# Containers: rename !docker-compose.yaml, then use {{COMPOSE_FILE}} (that
+# placeholder only exists once a compose file is present). Drop the User= and
+# PATH= lines above - compose runs as root against the daemon socket.
+#   ExecStart=/usr/bin/docker compose -f {{COMPOSE_FILE}} up
+#   ExecStop=/usr/bin/docker compose -f {{COMPOSE_FILE}} down
 ExecStart={{RUBY}} -S bundle exec rackup -p {{PORT}} -E production
 Restart=always
 RestartSec=5

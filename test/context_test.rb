@@ -199,4 +199,75 @@ class ContextTest < Minitest::Test
       assert_equal [:PORT], LuxDeploy::Commands.needed_port_keys(ctx)
     end
   end
+
+  # ---- rendered_templates -------------------------------------------------
+
+  def test_rendered_templates_maps_every_template_to_its_artifact
+    in_app({ 'job.service' => '' }) do |ctx|
+      assert_equal({ '.env.main'   => '.env',
+                     'caddy.conf'  => 'caddy.config',
+                     'systemd.service' => 'systemd.service',
+                     'job.service' => 'systemd.job.service' }, ctx.rendered_templates)
+    end
+  end
+
+  def test_rendered_templates_uses_the_branch_env_template
+    in_app({ '.env.topic' => '' }, branch: 'topic') do |ctx|
+      assert_equal '.env', ctx.rendered_templates['.env.topic']
+      refute ctx.rendered_templates.key?('.env.default')
+    end
+  end
+
+  # ---- container mode -----------------------------------------------------
+
+  def test_a_compose_file_switches_on_container_mode
+    in_app({ 'docker-compose.yaml' => 'name: x' }) do |ctx|
+      assert ctx.compose?
+      assert_equal 'docker-compose.yaml', ctx.compose_template
+      assert_equal '/home/deployer/apps/example.com/main/docker-compose.yaml', ctx.compose_file
+      assert_equal 'docker-compose.yaml', ctx.rendered_templates['docker-compose.yaml']
+    end
+  end
+
+  def test_no_compose_file_means_no_container_mode
+    in_app do |ctx|
+      refute ctx.compose?
+      assert_nil ctx.compose_template
+      assert_nil ctx.compose_file
+    end
+  end
+
+  def test_every_name_docker_accepts_is_recognised
+    %w[docker-compose.yaml docker-compose.yml compose.yaml compose.yml].each do |name|
+      in_app({ name => 'name: x' }) { |ctx| assert_equal name, ctx.compose_template }
+    end
+  end
+
+  def test_compose_precedence_is_dockers_own
+    in_app({ 'compose.yml' => '', 'docker-compose.yaml' => '' }) do |ctx|
+      err = assert_raises(LuxDeploy::Error) { ctx.compose_template }
+      assert_includes err.message, 'more than one compose file'
+    end
+  end
+
+  # Parking it is how you turn containers back off, same as !job.service.
+  def test_a_bang_prefixed_compose_file_is_ignored
+    in_app({ '!docker-compose.yaml' => 'name: x' }) { |ctx| refute ctx.compose? }
+  end
+
+  def test_compose_placeholders_feed_port_allocation_and_the_ruby_probe
+    in_app({ 'docker-compose.yaml' => "ports: ['127.0.0.1:{{PORT_WEB}}:8080']\n" }) do |ctx|
+      assert_includes LuxDeploy::Commands.needed_port_keys(ctx), :PORT_WEB
+    end
+    in_app({ 'docker-compose.yaml' => 'command: {{RUBY}} -S rake' }) { |ctx| assert ctx.ruby_used? }
+  end
+
+  # The compose file has to be on the box before remote_before.sh runs - that
+  # hook is where `docker compose pull|build` belongs.
+  def test_compose_is_uploaded_pre_swap_alongside_env
+    in_app({ 'docker-compose.yaml' => '' }) do |ctx|
+      assert_equal %w[.env docker-compose.yaml], LuxDeploy::Commands.pre_swap_artifacts(ctx)
+    end
+    in_app { |ctx| assert_equal ['.env'], LuxDeploy::Commands.pre_swap_artifacts(ctx) }
+  end
 end

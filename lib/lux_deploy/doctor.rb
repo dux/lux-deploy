@@ -18,6 +18,7 @@ module LuxDeploy
       GIT_BRANCH GIT_BRANCH_UNDERSCORE GIT_BRANCH_SLUG GIT_COMMIT GIT_COMMIT_SHORT
       APP APP_UNDERSCORE APP_DOMAIN DOMAIN HASH TAG
       PORT DIR RUBY RUBY_DIR LOG_DIR LOG_NAME SERVICE_USER SERVICE_HOME
+      COMPOSE_FILE
     ].freeze
 
     module_function
@@ -94,13 +95,24 @@ module LuxDeploy
       Dir.glob("#{dir}/*").any? { |f| File.file?(f) && File.read(f).include?('{{RUBY') }
     end
 
-    # True when a unit template drives containers - gates the docker host
-    # checks so every other app is unaffected.
+    # The app's compose file, or nil. Mirrors Context#compose_template but
+    # reads the filesystem directly: doctor has to work in a project whose
+    # .yaml is malformed or whose branch has no commit, and Context.build
+    # raises on both.
+    def compose_file(dir = './config/deploy')
+      Context::COMPOSE_NAMES.map { |n| "#{dir}/#{n}" }.find { |f| File.file?(f) }
+    end
+
+    # True when this app drives containers - gates the docker host checks so
+    # every other app is unaffected. Either a compose file is present (which is
+    # the whole mode switch) or a unit says so.
     #
-    # Only *.service files, and never a "!"-disabled one: those are switched
-    # off everywhere else in the engine, so a !docker.service someone parked
-    # must not make doctor start demanding a docker daemon.
+    # The unit scan is *.service files only, and never a "!"-disabled one:
+    # those are switched off everywhere else in the engine, so a
+    # !docker.service someone parked must not make doctor start demanding a
+    # docker daemon.
     def docker?(dir = './config/deploy')
+      return true if compose_file(dir)
       Dir.glob("#{dir}/*.service")
          .reject { |f| File.basename(f).start_with?('!') }
          .any? { |f| File.file?(f) && File.read(f).match?(/\b(docker|podman)\b/) }
@@ -219,9 +231,16 @@ module LuxDeploy
       # reference yaml keys + engine vars (not anything defined in .env).
       # Every *.service file is a service; only systemd.service is required.
       # PORT-prefixed placeholders are engine-provided (auto-allocated).
+      #
+      # Deliberately re-derived here from the filesystem rather than through
+      # Context#rendered_templates: doctor has to survive - and report on - a
+      # malformed .yaml, a branch with no commit and a missing caddy.conf,
+      # every one of which makes Context.build raise.
       service_files       = Dir.children(dir).select { |f| f.end_with?('.service') && !f.start_with?('!') }.sort
+      compose_path        = compose_file(dir)
+      compose_name        = compose_path && File.basename(compose_path)
       optional            = env_files + (service_files - %w[systemd.service])
-      placeholder_targets = env_files + %w[caddy.conf] + service_files
+      placeholder_targets = env_files + %w[caddy.conf] + service_files + [compose_name].compact
       provided            = PROVIDED_VARS + yaml_keys
       placeholder_targets.uniq.each do |name|
         path = "#{dir}/#{name}"
@@ -237,7 +256,44 @@ module LuxDeploy
                     ok ? nil : "missing: #{missing.map { |v| "{{#{v}}}" }.join(' ')}")
       end
 
+      compose_checks(dir, compose_path, service_files, report, nag) if compose_path
+
       failed
+    end
+
+    # Container-mode checks. Only two of these are hard failures, and both are
+    # cases where the deploy would otherwise succeed and serve nothing (or,
+    # worse, serve someone else's containers).
+    def compose_checks(dir, path, service_files, report, nag)
+      name = File.basename(path)
+      body = File.read(path)
+
+      # `docker compose -f X` takes the project name from dirname(X), which
+      # here is <remote_base>/<domain>/<branch> - so every app on this host
+      # deploying `main` would share the project `main`. `compose ps` in one
+      # then lists another's containers and `compose down` can tear it down.
+      # The engine will not inject -p or rewrite this file; it refuses instead.
+      report.call(body.match?(/^name:\s*\S/), "#{name} sets a compose project name",
+                  'add `name: {{APP}}` - without it the project name is the branch dir, ' \
+                  'which every app on this host shares')
+
+      # The mode switch is this file existing, but nothing runs it unless a
+      # unit says so. Without this check that mistake deploys clean and serves
+      # nothing.
+      # Live lines only. The shipped systemd.service documents the compose
+      # ExecStart in a comment block, so scanning the whole file would pass
+      # every app that never uncommented it - the exact mistake being checked.
+      wired = service_files.any? do |f|
+        File.read(File.join(dir, f)).lines
+            .reject { |l| l.strip.start_with?('#', ';') }
+            .any? { |l| l.match?(/\{\{COMPOSE_FILE\}\}|\bcompose\b/) }
+      end
+      report.call(wired, "a *.service runs #{name}",
+                  "no unit references it; set ExecStart=/usr/bin/docker compose -f {{COMPOSE_FILE}} up")
+
+      # Rendered fresh every deploy and uploaded 0644, same as the unit files.
+      nag.call(!body.match?(/(?i:password|secret|token)\s*[:=]/), "#{name} has no inline secrets",
+               "it is uploaded world-readable; keep values in .env and reference them via env_file / ${VAR}")
     end
 
     def build_checks(config)
@@ -300,7 +356,8 @@ module LuxDeploy
             "sudo -iu #{user} bash -lc 'gem install bundler --no-document'"
           ]
         ] : []),
-        # Containers: only when a unit template actually drives one.
+        # Containers: only when this app actually drives them - a compose file
+        # is present, or a unit template says docker/podman.
         *(docker? ? [
           [
             'docker installed',
@@ -326,6 +383,17 @@ module LuxDeploy
           [
             "docker reachable as #{user}",
             "sudo -iu #{user} bash -lc 'docker info >/dev/null 2>&1'",
+            nil
+          ]
+        ] : []),
+        # Compose v2 specifically, and only for an app that ships a compose
+        # file. prepare:docker only echoes a warning about this, which is the
+        # wrong place for it: the unit fails at `compose` being an unknown
+        # command, long after prepare ran.
+        *(compose_file ? [
+          [
+            'docker compose plugin (v2)',
+            'docker compose version >/dev/null 2>&1 || docker-compose version >/dev/null 2>&1',
             nil
           ]
         ] : []),

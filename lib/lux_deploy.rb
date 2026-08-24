@@ -1,4 +1,5 @@
 require 'fileutils'
+require 'json'
 require 'pathname'
 require 'open3'
 require 'set'

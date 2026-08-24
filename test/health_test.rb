@@ -122,3 +122,103 @@ class HealthGateTest < Minitest::Test
     assert_equal 'probe did not complete', LuxDeploy::Commands.gate_failure('')
   end
 end
+
+# The container half of the gate. `systemctl is-active` says "compose is
+# running", which is true of a stack where everything but the web container
+# is dead - so these all run the unit past that point.
+class ContainerGateTest < Minitest::Test
+  include ProjectFixture
+
+  YAML_MIN ||= "server: s\ndomain: example.com\n".freeze
+
+  # Records what it was asked, so a test can assert the gate stayed silent.
+  class Ssh
+    attr_reader :calls
+    def initialize(out = '') = (@out, @calls = out, [])
+    def dry_run = false
+    def run(cmd, **_opts) = (@calls << cmd; @out)
+    def stream(cmd, **_opts) = (@calls << cmd; true)
+  end
+
+  def in_app(files, out: '', yaml: YAML_MIN)
+    in_project({ '.yaml' => yaml, '.env.main' => '', 'caddy.conf' => '',
+                 'systemd.service' => '' }.merge(files)) do
+      system('git', 'init', '--quiet', '--initial-branch', 'main', out: File::NULL, err: File::NULL)
+      system({ 'GIT_AUTHOR_NAME' => 't', 'GIT_AUTHOR_EMAIL' => 't@t',
+               'GIT_COMMITTER_NAME' => 't', 'GIT_COMMITTER_EMAIL' => 't@t' },
+             'git', 'commit', '--quiet', '--allow-empty', '-m', 'init',
+             out: File::NULL, err: File::NULL)
+      ctx = LuxDeploy::Context.build({})
+      ctx.instance_variable_set(:@ssh, Ssh.new(out))
+      ctx.ports = { PORT: 3010 }
+      yield ctx
+    end
+  end
+
+  def ps(*rows) = "__PS__\n#{rows.map(&:to_json).join("\n")}\n"
+
+  def test_a_non_container_app_never_touches_the_daemon
+    in_app({}) do |ctx|
+      capture_io { LuxDeploy::Commands.assert_containers_healthy(ctx) }
+      assert_empty ctx.ssh.calls
+    end
+  end
+
+  def test_a_healthy_stack_passes
+    rows = [{ 'Service' => 'web', 'State' => 'running', 'Health' => 'healthy' },
+            { 'Service' => 'db',  'State' => 'running', 'Health' => 'healthy' }]
+    in_app({ 'docker-compose.yaml' => "name: x\n" }, out: ps(*rows)) do |ctx|
+      capture_io { assert_nil LuxDeploy::Commands.assert_containers_healthy(ctx) }
+    end
+  end
+
+  def test_a_dead_dependency_fails_and_names_it
+    rows = [{ 'Service' => 'web', 'State' => 'running', 'Health' => 'healthy' },
+            { 'Service' => 'db',  'State' => 'restarting', 'Health' => '' }]
+    in_app({ 'docker-compose.yaml' => "name: x\n" }, out: ps(*rows)) do |ctx|
+      err = nil
+      capture_io { err = assert_raises(LuxDeploy::Error) { LuxDeploy::Commands.assert_containers_healthy(ctx) } }
+
+      assert_includes err.message, 'db is restarting'
+      assert_includes err.message, '/home/deployer/apps/example.com/main/docker-compose.yaml'
+      # The container's stdout never reaches the journal for a compose unit,
+      # so the failing service's logs are the only useful dump.
+      assert ctx.ssh.calls.any? { |c| c.include?('logs --no-color') && c.include?('db') }
+    end
+  end
+
+  def test_an_empty_stack_is_a_failure_not_a_pass
+    in_app({ 'docker-compose.yaml' => "name: x\n" }, out: "__PS__\n") do |ctx|
+      err = nil
+      capture_io { err = assert_raises(LuxDeploy::Error) { LuxDeploy::Commands.assert_containers_healthy(ctx) } }
+      assert_includes err.message, 'compose reported no containers'
+    end
+  end
+
+  def test_the_probe_polls_on_the_boot_timeout_budget
+    in_app({ 'docker-compose.yaml' => "name: x\n" },
+           out: ps({ 'Service' => 'web', 'State' => 'running' }),
+           yaml: "#{YAML_MIN}boot_timeout: 90\n") do |ctx|
+      capture_io { LuxDeploy::Commands.assert_containers_healthy(ctx) }
+      probe = ctx.ssh.calls.first
+
+      assert_includes probe, 'ps --all --format json'
+      assert_includes probe, '[ $i -ge 90 ]'
+      assert_includes probe, 'docker-compose -f'   # v1 fallback
+    end
+  end
+
+  # Both existing overrides short-circuit before the container gate: health.sh
+  # replaces the built-in probe outright, containers included.
+  def test_health_false_and_health_sh_both_skip_the_container_gate
+    in_app({ 'docker-compose.yaml' => "name: x\n" }, yaml: "#{YAML_MIN}health: false\n") do |ctx|
+      capture_io { LuxDeploy::Commands.run_health_gate(ctx, []) }
+      assert_empty ctx.ssh.calls
+    end
+
+    in_app({ 'docker-compose.yaml' => "name: x\n", 'health.sh' => "exit 0\n" }) do |ctx|
+      capture_io { LuxDeploy::Commands.run_health_gate(ctx, []) }
+      refute ctx.ssh.calls.any? { |c| c.include?('compose') }
+    end
+  end
+end

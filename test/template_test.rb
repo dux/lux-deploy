@@ -74,6 +74,39 @@ class TemplateTest < Minitest::Test
     assert_equal 'hello=world',     env[:GREETING]
   end
 
+  # One pass, one var set: the compose file gets exactly what the units get,
+  # and {{COMPOSE_FILE}} only exists once there is a compose file to name.
+  def test_render_artifacts_covers_the_compose_file
+    ssh = Class.new do
+      def dry_run = false
+      def run(*, **) = ''
+    end.new
+
+    in_project({ '.yaml' => "server: s\ndomain: example.com\n", '.env.main' => "PORT=\n",
+                 'caddy.conf' => 'reverse_proxy :{{PORT}}',
+                 'systemd.service' => 'ExecStart=/usr/bin/docker compose -f {{COMPOSE_FILE}} up',
+                 'docker-compose.yaml' => "name: {{APP}}\nports: ['127.0.0.1:{{PORT}}:8080']\n" }) do
+      quiet = { out: File::NULL, err: File::NULL }
+      system('git', 'init', '--quiet', '--initial-branch', 'main', quiet)
+      system({ 'GIT_AUTHOR_NAME' => 't', 'GIT_AUTHOR_EMAIL' => 't@t',
+               'GIT_COMMITTER_NAME' => 't', 'GIT_COMMITTER_EMAIL' => 't@t' },
+             'git', 'commit', '--quiet', '--allow-empty', '-m', 'init', quiet)
+
+      ctx = LuxDeploy::Context.build({})
+      ctx.instance_variable_set(:@ssh, ssh)
+      ctx.ports = { PORT: 3010 }
+      capture_io { LuxDeploy::Commands.render_artifacts(ctx) }
+
+      dir = '/home/deployer/apps/example.com/main'
+      assert_equal %w[.env caddy.config systemd.service docker-compose.yaml].sort,
+                   ctx.rendered.keys.sort
+      assert_equal "name: example.com-main\nports: ['127.0.0.1:3010:8080']\n",
+                   ctx.rendered['docker-compose.yaml']
+      assert_includes ctx.rendered['systemd.service'], "-f #{dir}/docker-compose.yaml"
+      assert_includes ctx.rendered['.env'], 'PORT=3010'
+    end
+  end
+
   def test_parse_env_raw_keeps_the_value_verbatim
     raw = LuxDeploy::Template.parse_env_raw(<<~ENV)
       # comment

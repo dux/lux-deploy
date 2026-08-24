@@ -18,6 +18,7 @@ Host defaults are baked into the gem, and app-specific settings go in the deploy
 A file is the contract.
 Drop `job.service` in `config/deploy/` and it deploys as a second unit.
 Drop `remote_before.sh` and it becomes your build step.
+Drop `docker-compose.yaml` and it is a container deploy.
 Prefix any file with `!` and it disappears from the deploy.
 Nothing to register, nothing to wire up - and when you do want to wire something up by hand, the file you would edit is the same one the engine reads.
 
@@ -259,6 +260,7 @@ lux-deploy host:apps   # every app on the host, from their manifests
 ```
 
 `status` reads `<app_dir>/lux-deploy.yaml`, then asks systemd which units are active, checks whether anything is listening on each allocated port, resolves every `/etc/caddy/sites` and `/etc/systemd/system` symlink, and confirms that what Caddy proxies to is what `.env` says `PORT` is.
+For a [container deploy](#containers) it also prints a `containers` block - one line per compose service with its state and health, which is the thing `systemctl is-active` cannot tell you.
 `host:apps` reads every `<remote_base>/*/lux-deploy.yaml` in one round trip.
 
 ## Commands
@@ -321,6 +323,7 @@ config/deploy/
   caddy.conf             # caddy site file
   systemd.service        # the web service (caddy-fronted)
   <name>.service         # optional: any extra service (job runner, grpc, ...)
+  docker-compose.yaml    # optional: present means this is a container deploy
 ```
 
 The two required keys are `server` and `domain`.
@@ -353,6 +356,270 @@ PORT_JOB=                       PORT_JOB=3020
 Nothing here is Ruby-specific.
 `{{RUBY}}`/`{{RUBY_DIR}}` (and the ruby probe) are only resolved when a template actually references them - a Go or Python service whose unit runs a built binary (`ExecStart={{DIR}}/release/app`) never triggers the probe, and `doctor` skips the ruby/bundler host checks.
 Build your app however you like in `remote_before.sh` (`go build`, `pip install`, `npm ci`, `bundle install`); post-deploy verification goes in `remote_after.sh` and fails the command by exiting non-zero.
+
+## Containers
+
+Docker is not required, but it is supported the same way everything else here is: by a file.
+Put a `docker-compose.yaml` in `config/deploy/` and this is a container deploy.
+There is no `mode:` key and no adapter class - the engine still rsyncs a release, renders templates, installs a systemd unit and a caddy site file, and gates on health.
+It just knows about one more template, and looks one level deeper when it checks that the release came up.
+
+```sh
+lux-deploy prepare:docker      # once per host: engine + compose v2, service user in the docker group
+lux-deploy app:init            # ships !docker-compose.yaml; rename it to enable
+```
+
+`docker-compose.yaml`, `docker-compose.yml`, `compose.yaml` and `compose.yml` are all recognised, in that order.
+Two of them present is an error rather than a coin flip.
+Prefixing with `!` disables it like any other file, and turns the app back into an ordinary deploy.
+
+What changes once that file exists:
+
+* It is **rendered** with exactly the same vars as the units - `{{PORT}}`, `{{DIR}}`, `{{APP}}`, `{{GIT_COMMIT_SHORT}}`. An unresolvable `{{VAR}}` fails the deploy instead of shipping literally, and `doctor` catches it locally first.
+* `{{COMPOSE_FILE}}` appears in the placeholder namespace, holding the absolute remote path. Use it in the unit so the filename lives in one place.
+* It is uploaded to `<app_dir>/` **before `remote_before.sh` runs**, so that hook can `docker compose pull` or `build` against the file this deploy will actually run.
+* It is snapshotted into `release/.lux-deploy/`, so `rollback` puts it back with the code rather than leaving the new stack definition over old code.
+* Its `{{PORT*}}` placeholders feed port allocation, same as a unit's.
+* The health gate gains a container assertion, and `status` grows a `containers` block.
+* `doctor` adds a compose-plugin host check, and two local checks that are hard failures.
+
+### A worked example: web + postgres
+
+From nothing to a deployed two-container stack.
+Six files, each shown in full - nothing is elided, and there is no seventh.
+
+```sh
+lux-deploy prepare:docker                # once per host
+lux-deploy app:init                      # writes config/deploy/
+mv config/deploy/'!docker-compose.yaml' config/deploy/docker-compose.yaml
+```
+
+**`config/deploy/.yaml`** - the two required keys, plus an HTTP probe on top of the port wait:
+
+```yaml
+server: srv.example.com
+domain: example.com, www.example.com
+health_path: /up
+```
+
+**`config/deploy/.env.main`** - the *shape* of the runtime env.
+It is rendered fresh on every deploy, so nothing secret lives here; the two empty keys are filled in on the server once and survive every later deploy.
+
+```sh
+RACK_ENV=production
+DOMAIN={{DOMAIN}}
+POSTGRES_DB=app
+POSTGRES_USER=postgres
+
+# Handed to remote_before.sh, which runs with this file sourced and exported.
+# `docker compose` honours COMPOSE_FILE natively, so the hook needs no -f.
+COMPOSE_FILE={{COMPOSE_FILE}}
+DEPLOY_TAG={{GIT_COMMIT_SHORT}}
+
+# Empty on purpose. These two are set once on the server and survive every
+# deploy - the repo holds the shape of the env, the box holds the values:
+#   lux-deploy env:set POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   lux-deploy env:set DB_URL=postgresql://postgres:<that>@db:5432/app
+POSTGRES_PASSWORD=
+DB_URL=
+```
+
+**`config/deploy/docker-compose.yaml`** - both services read the same `.env`, so no secret is ever interpolated into this file:
+
+```yaml
+name: {{APP}}
+
+services:
+  web:
+    image: example-app:{{GIT_COMMIT_SHORT}}
+    restart: unless-stopped
+    env_file: {{DIR}}/.env
+    ports:
+      - '127.0.0.1:{{PORT}}:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:8080/up || exit 1']
+      interval: 5s
+      start_period: 20s
+      retries: 5
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file: {{DIR}}/.env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $POSTGRES_USER']
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+```
+
+**`config/deploy/systemd.service`** - delete the `User=` and `Environment="PATH=..."` lines `app:init` shipped; compose talks to the root daemon:
+
+```ini
+[Unit]
+Description={{DOMAIN}}
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory={{DIR}}
+ExecStart=/usr/bin/docker compose -f {{COMPOSE_FILE}} up
+ExecStop=/usr/bin/docker compose -f {{COMPOSE_FILE}} down
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**`config/deploy/remote_before.sh`** - the build step, which is the only place lux-deploy has an opinion about your language (none):
+
+```sh
+# Runs on the server in new-release/, with the rendered .env exported - so
+# DEPLOY_TAG and COMPOSE_FILE are already set. Non-zero here aborts the
+# deploy and release/ keeps serving.
+docker build -t "example-app:$DEPLOY_TAG" .
+docker compose run --rm web bin/rails db:migrate
+```
+
+**`config/deploy/caddy.conf`** - unchanged from a non-container app, because Caddy has no idea a container is involved:
+
+```
+{{DOMAIN}} {
+  reverse_proxy localhost:{{PORT}} {
+    lb_try_duration 10s
+  }
+}
+```
+
+Then:
+
+```
+$ lux-deploy env:set POSTGRES_PASSWORD=$(openssl rand -hex 16)
+$ lux-deploy doctor
+$ lux-deploy up
+==> deploy example.com-main (branch main) -> srv.example.com
+==> ensure remote dirs
+==> take deploy lock (/home/deployer/apps/example.com/main/.deploy.lock)
+==> allocate ports
+    allocated PORT=3010
+==> rsync code
+==> mise install (pinned toolchain)
+==> render templates
+==> write rendered .env + docker-compose.yaml
+==> run config/deploy/remote_before.sh (server, in new-release, .env sourced)
+==> release swap
+==> write rendered systemd.service / caddy.config
+==> install systemd + caddy symlinks
+==> restart services
+==> health gate: wait for PORT=3010 (30s)
+==> health gate: compose stack /home/deployer/apps/example.com/main/docker-compose.yaml (30s)
+==> reload caddy
+==> write lux-deploy.yaml
+==> done. https://example.com (PORT=3010)
+```
+
+Note the order: the compose file is written *before* `remote_before.sh`, and the container gate runs *after* the port wait.
+
+This is what lands at `<app_dir>/docker-compose.yaml` - the file compose actually runs:
+
+```yaml
+name: example.com-main
+
+services:
+  web:
+    image: example-app:50f7fc0
+    restart: unless-stopped
+    env_file: /home/deployer/apps/example.com/main/.env
+    ports:
+      - '127.0.0.1:3010:8080'
+...
+```
+
+`50f7fc0` is the commit being deployed, so the image tag is immutable and rolls back with the code.
+`3010` was allocated once and is reused on every later deploy, which is why the Caddy upstream never changes.
+
+`status` reports the stack, not just the unit:
+
+```
+$ lux-deploy status
+  services
+    web-example.com-main active
+  ports
+    PORT=3010 listening
+  containers  /home/deployer/apps/example.com/main/docker-compose.yaml
+    web                  running      healthy
+    db                   running      healthy
+  rollback    available (lux-deploy rollback)
+```
+
+And when the stack does not come up, the deploy fails instead of reporting success:
+
+```
+$ lux-deploy up
+==> health gate: compose stack /home/deployer/apps/example.com/main/docker-compose.yaml (30s)
+  --- docker compose -f /home/deployer/apps/example.com/main/docker-compose.yaml logs --tail 40 db ---
+  db-1  | FATAL:  password authentication failed for user "postgres"
+ERROR: health gate failed: db is restarting (/home/deployer/apps/example.com/main/docker-compose.yaml).
+  The unit is active - compose is running - but the stack is not.
+```
+
+The unit *is* active and port 3010 *is* bound - `web` came up fine.
+Without the container check this deploy reports success and serves 500s.
+
+### The rules
+
+**`name:` is required, and `doctor` fails without it.**
+`docker compose -f <file>` derives the project name from the file's directory, which here is `<remote_base>/<domain>/<branch>`.
+Without a `name:` every app on the host deploying `main` shares the compose project `main` - `docker compose ps` in one lists another's containers, and `docker compose down` in one can tear another down.
+The engine will not inject `-p` or rewrite your file; it refuses to deploy instead.
+
+**Secrets do not go in this file.**
+It is rendered from the repo and uploaded 0644, exactly like the unit files.
+Values belong in the branch's `.env.*` template and in `lux-deploy env:set`, reached from compose via `env_file: {{DIR}}/.env`.
+
+### What the health gate proves
+
+The stock gate waits for every `PORT*` to be listening, then asserts every unit is `active` with zero restarts.
+That is not enough for a stack: compose stays cheerfully active while postgres crash-loops behind a web container that already bound its port.
+
+So for a container deploy the gate also runs `docker compose ps` and requires every service to be `running`, and - where the image declares a `HEALTHCHECK` - `healthy`.
+It polls rather than samples, on the same `boot_timeout` budget, because a container with a `start_period` is still `starting` for a while after the port opens.
+Note that makes `boot_timeout` per phase: a thoroughly broken deploy can wait it out twice.
+
+Two deliberate passes:
+
+* A service with no `HEALTHCHECK` passes on `running` alone. Inventing a verdict there would fail every stock image.
+* A service that `exited 0` passes - that is a one-shot (migrations, an asset build) that is supposed to be finished by the time the gate looks. A non-zero exit fails.
+
+On failure the deploy prints `docker compose logs` for the failing services only.
+`journalctl` is useless here: for a `compose up -d` unit the container's stdout never reaches the journal.
+
+`health: false` and `config/deploy/health.sh` both override this exactly as they override the port wait - `health.sh` replaces the built-in gate entirely, containers included.
+
+### Images and rollback
+
+Use an immutable per-commit tag (`{{GIT_COMMIT_SHORT}}`), and build or pull it in `remote_before.sh` - the compose file is already on the box when that hook runs.
+`rollback` restores the unit, the `.env` and the compose file together, so the image tag goes back with the code rather than drifting from it.
+
+That only holds while the previous image is still on the box.
+An aggressive `docker image prune` leaves you with a rollback that swaps the code back and then cannot start.
+
+Known limits, none of which the engine papers over:
+
+* The engine never runs `docker compose up` / `pull` / `down` itself. The unit is the interface; that is the point.
+* A deploy that dies between the artifact upload and the release swap leaves `<app_dir>/docker-compose.yaml` newer than `release/`. `.env` has always had the same window.
+* `config/deploy/docker-compose.yaml` is also rsynced into the release **unrendered**, so `release/config/deploy/docker-compose.yaml` still shows `{{PORT}}`. Run compose against `{{COMPOSE_FILE}}`, never against the copy in the release.
+* Rootless Docker (a per-user daemon) is not covered - `prepare:docker` adds the service user to the `docker` group, and the gate probes the root daemon.
+* `podman` is detected but not driven: `prepare:docker` and the gate both shell out to `docker`. Use `health.sh` as the escape hatch.
 
 ## Server layout
 
@@ -426,13 +693,13 @@ Consumers: humans, LLMs, monitoring scripts, and lux-deploy itself - `status`, `
 
 ## Template substitution
 
-Every template (the branch's `.env.*`, `caddy.conf`, and each `*.service` unit) is rendered in a single pass with the same vars:
+Every template (the branch's `.env.*`, `caddy.conf`, each `*.service` unit, and the compose file if there is one) is rendered in a single pass with the same vars:
 
 1. **Git** (computed locally): `{{GIT_BRANCH}}`, `{{GIT_BRANCH_UNDERSCORE}}`, `{{GIT_BRANCH_SLUG}}`, `{{GIT_COMMIT}}`, `{{GIT_COMMIT_SHORT}}`
 2. **App** (derived from `domain:`): `{{APP}}`, `{{APP_UNDERSCORE}}`, `{{HASH}}` (`h` + first 6 SHA-256 hex chars of the main domain), `{{TAG}}` (`s` + first 5 SHA-256 hex chars of the main domain)
 3. **`.yaml`**: every non-behavioral key uppercased -- `{{SERVER}}`, `{{DOMAIN}}`, etc.
 4. **Ports**: `{{PORT}}` and any `{{PORT_*}}` -- reused from the existing `.env`, or first free ports in `3010..3990` step 10
-5. **Derived**: `{{DIR}}`, `{{LOG_DIR}}`, `{{LOG_NAME}}`, `{{SERVICE_USER}}`, `{{SERVICE_HOME}}`, plus `{{RUBY}}`/`{{RUBY_DIR}}` only when a template references them
+5. **Derived**: `{{DIR}}`, `{{LOG_DIR}}`, `{{LOG_NAME}}`, `{{SERVICE_USER}}`, `{{SERVICE_HOME}}`, plus `{{RUBY}}`/`{{RUBY_DIR}}` only when a template references them, and `{{COMPOSE_FILE}}` only when a compose file is present
 
 An unresolved `{{VAR}}` is an error, not a silently shipped placeholder; `doctor` runs the same check locally before you deploy.
 
@@ -446,8 +713,10 @@ ExecStart=/usr/bin/docker run --rm --name {{APP_UNDERSCORE}} \
 ```
 
 Put `DEPLOY_SHA={{GIT_COMMIT_SHORT}}` in the branch's `.env.*` and `remote_before.sh` can build that same tag -- hooks run with `.env` sourced.
-Rollback restores both the unit and `.env` from `release/.lux-deploy/`, so the image tag goes back with the code rather than drifting from it.
+Rollback restores the unit, the `.env` and the compose file from `release/.lux-deploy/`, so the image tag goes back with the code rather than drifting from it.
 That only holds for an immutable per-commit tag, and only while the previous image is still on the box -- an aggressive `docker image prune` will leave you with a rollback that swaps code back and then cannot start.
+
+For a multi-container app write a compose file instead of a long `docker run` line; see [Containers](#containers).
 
 `.env` does **not** feed back into the placeholder namespace.
 It is a runtime-only file -- rendered once, uploaded, and read by the running app at boot.
@@ -474,16 +743,22 @@ Behavioral keys (`service_user`, `remote_base`, `service_prefix`, `on_fail`, `sr
  9. rsync code to new-release/
 10. symlink tmp, log, .env into new-release/
 11. mise install, if the app ships a mise.toml
-12. render templates (.env + .env.local overlay, caddy.conf, each *.service unit)
-13. upload rendered artifacts to <app_dir>/ and to new-release/.lux-deploy/
+12. render templates (.env + .env.local overlay, caddy.conf, each *.service unit, the compose file)
+13a. upload .env and the compose file to <app_dir>/ and new-release/.lux-deploy/
+                       Only these two, and only because the hook needs them: the release symlinks
+                       to .env, and `docker compose pull|build` needs the file it will run.
 14. remote_before.sh  (SERVER, in new-release/, .env sourced; abort on failure -- new-release/ kept for inspection)
                        This is where your app installs gems / npm / go build / migrations / asset compile.
                        lux-deploy ships nothing language-specific past this point.
 15. release swap:  rm old-release; mv release old-release; mv new-release release
+13b. upload the remaining artifacts (caddy.config, each unit) -- held back until the
+                       release they describe is actually live, because the installed unit is a
+                       symlink into <app_dir> and a reboot would otherwise start the wrong code
 16. ensure <app_dir>/log exists, if caddy.config emits a JSONL access log
 17. install symlinks under /etc/systemd/system and /etc/caddy/sites
 18. systemctl daemon-reload + enable/restart every service
-19. health gate: wait for every PORT* to be listening, assert every unit is active
+19. health gate: wait for every PORT* to be listening, assert every unit is active,
+                       and for a container deploy assert every compose service is running/healthy
                        (or run config/deploy/health.sh instead, if it exists)
 20. systemctl reload caddy   <- traffic only now points at the new release
 21. remote_after.sh   (SERVER, in release/, .env sourced)

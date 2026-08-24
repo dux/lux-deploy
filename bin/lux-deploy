@@ -1,11 +1,31 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+# Bundler first so a Gemfile's path gems (./.gems/lux-hammer) land on
+# $LOAD_PATH. Checkout libs are unshifted after so they win over bundler
+# or an installed gem.
+if File.exist?('Gemfile') && !defined?(Bundler)
+  begin
+    require 'bundler/setup'
+  rescue LoadError, StandardError
+  end
+end
+
 # Prefer the adjacent lib/ when this script lives in a repo checkout
 # (lib/lux_deploy.rb sits next to bin/), otherwise fall back to the
 # installed gem. Avoids an installed older gem shadowing local edits.
 local_lib = File.expand_path('../lib/lux_deploy.rb', __dir__)
 $LOAD_PATH.unshift File.dirname(local_lib) if File.file?(local_lib)
+
+# lux-hammer is a sibling checkout in dev (`../lux-hammer/lib`), or the
+# app's ./.gems copy. Without this, `require 'lux-hammer'` needs a gem
+# install the checkout bin does not have.
+[
+  File.expand_path('../../lux-hammer/lib/lux-hammer.rb', __dir__),
+  File.expand_path('.gems/lux-hammer/lib/lux-hammer.rb'),
+].each do |file|
+  $LOAD_PATH.unshift File.dirname(file) if File.file?(file)
+end
 
 require 'lux-hammer'
 
